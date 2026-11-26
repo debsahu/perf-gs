@@ -100,6 +100,7 @@ EXPECTED_DEFAULTS = {
     "stream_every": 10,
     "vram_budget_gib": 0.0,
     "image_residency": "stream",
+    "target_prefetch": 4,
     "adam_moments": "bf16",
     "splat_kernel": "gaussian",
     "splat_profile_power": 1.0,

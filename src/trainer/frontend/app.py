@@ -32,7 +32,7 @@ from trainer.config.config import (
 )
 from trainer.config.config_types import DensificationMode, LearningRateRecipe
 from trainer.config.resolve import RunConfig, shader_specialization
-from trainer.config.validation import validate_training_config
+from trainer.config.validation import dispatch_groups_x, validate_training_config
 from trainer.data.parallel import map_ordered
 from trainer.data.targets import TargetDataset
 from trainer.frontend.cli import parse_args
@@ -162,7 +162,8 @@ class TrainingApplication:
         self.scene_context = scene = load_scene_context(self.args, prepared)
         validate_training_config(self.args, n_cams=scene.camera_count,
                                  n_train=len(scene.train_indices),
-                                 n_test=len(scene.test_indices))
+                                 n_test=len(scene.test_indices),
+                                 max_dispatch_groups=dispatch_groups_x(getattr(self, "device", None)))
         self.config = RunConfig.from_args(self.args, scene.extent)
         self._write_resolved_config()
         self._prepare_target_dataset()

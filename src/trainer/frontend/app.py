@@ -34,7 +34,7 @@ from trainer.config.config_types import DensificationMode, LearningRateRecipe
 from trainer.config.resolve import RunConfig, shader_specialization
 from trainer.config.validation import dispatch_groups_x, validate_training_config
 from trainer.data.parallel import map_ordered
-from trainer.data.targets import TargetDataset
+from trainer.data.targets import CompressedTargetViews, TargetDataset
 from trainer.frontend.cli import parse_args
 from trainer.frontend.densification import DensificationController, DensifyOutcome
 from trainer.frontend.evaluation import run_report as run_report_module
@@ -225,6 +225,8 @@ class TrainingApplication:
                                  error, self._viewer.state)
         self.runtime = None
         self.pipeline = None
+        if self.targets is not None:
+            self.targets.close()
         self.targets = None
         self.target_textures = {}
         self.structure_textures = {}
@@ -320,7 +322,8 @@ class TrainingApplication:
                 "working_set_bytes": ram.rss or None,
                 "peak_working_set_bytes": ram.peak_rss or None,
                 **self._targets.host_image_bytes(),
-                "packed_training_images_bytes": sum(
+                # Compressed views are counted in decode_cache_bytes; iterating them would decode.
+                "packed_training_images_bytes": 0 if isinstance(self.target_textures, CompressedTargetViews) else sum(
                     image.nbytes for image in self.target_textures.values() if isinstance(image, np.ndarray)),
             }
             # Per-view textures live outside pipeline.buffers. Streamed views share scratch space.
@@ -359,6 +362,7 @@ class TrainingApplication:
             use_alpha=self.args.w_alpha > 0,
             masks_dir=getattr(self.args, "masks", None),
             invert_masks=bool(getattr(self.args, "invert_masks", False)),
+            residency="compressed" if self.args.image_residency == "compressed" else "decoded",
         )
         if self.args.write_ground_truths:
             self.targets.write_ground_truths(self.paths.cameras)
@@ -398,7 +402,8 @@ class TrainingApplication:
         Lowering capacity changes the trained model, so it is a reported last resort; the
         viewer is budgeted at full capacity since it grows to the trainer's splat count."""
         args = self.args
-        self._stream_targets = args.image_residency == "stream"
+        # Compressed targets stream from host RAM too, one decoded view at a time.
+        self._stream_targets = args.image_residency in ("stream", "compressed")
         structure = self._densify_mode == DensificationMode.STRUCTURE_AWARE
         module = _module_for_reflection(self.device, session)
         target_bytes = 0 if self._stream_targets else (
@@ -448,6 +453,13 @@ class TrainingApplication:
                            and not self._stream_targets)
         bytes_per_pixel = 4 + (8 if resident_fields else 0)
         planned_bytes = len(indices) * self._sceneContext.width * self._sceneContext.height * bytes_per_pixel
+        if self._targets.compressed:
+            self.target_textures = CompressedTargetViews(self._targets, pipeline.targets.pack, indices)
+            print(f"[memory] {len(indices)} training targets compressed in host RAM, decoded "
+                  f"{self.args.target_prefetch} steps ahead (decoded would be "
+                  f"{planned_bytes / 1024**3:.2f} GiB)")
+            self.structure_textures = self._structure_fields()
+            return
         where = "host RAM" if self._stream_targets else "GPU"
         print(f"[memory] {len(indices)} training targets"
               f"{'/structure fields' if resident_fields else ''} on {where}: "
@@ -980,6 +992,10 @@ class TrainingLoop:
         )
 
     def _prepare_iteration(self, context: IterationContext) -> None:
+        prefetch = getattr(self.target_textures, "prefetch", None)
+        if prefetch is not None:
+            # Compressed targets: keep this view and decode the sampler's next draws ahead.
+            prefetch([context.camera_index, *self.sampler.peek(self.args.target_prefetch)])
         self.runtime.pipeline.targets.select(self.target_textures[context.camera_index])
 
         if context.step_number == 1:

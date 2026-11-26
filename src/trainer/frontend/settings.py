@@ -286,9 +286,12 @@ SETTINGS: tuple[Setting, ...] = (
                  "fraction from step 1. No-op at --stbn-pixel-fraction 1.0.",
             minimum=0, maximum=20_000, speed=10, note="0 = no ramp"),
     Setting("image_residency", "training images", "perf", str, default="stream",
-            about="Streaming saves GPU memory. Keeping all training images on the GPU saves transfer time.",
-            choices=("stream", "gpu"), help="stream photos from host RAM and compute structure fields "
-            "when needed, or keep all training photos and their structure fields on the GPU."),
+            about="Streaming saves GPU memory. Keeping all training images on the GPU saves transfer time. "
+                  "Compressed keeps only the image files in host RAM and decodes a few views ahead.",
+            choices=("stream", "gpu", "compressed"), help="stream photos from host RAM and compute structure "
+            "fields when needed, keep all training photos and their structure fields on the GPU, or "
+            "'compressed': stream, but hold each photo in host RAM as its encoded file and decode it "
+            "on a background thread a few steps before it is trained on (same bytes as 'stream')."),
     Setting("adam_moments", "Adam moments", "perf", str, default="bf16",
             about="Precision of the optimizer state. bf16: the same quality with "
                   "0.7-1.7 GiB less memory, and slightly faster.",

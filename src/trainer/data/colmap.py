@@ -385,9 +385,7 @@ def load_colmap_image_native(entry: ColmapImageEntry, image_dir: Path, width: in
     dtype, exactly as ``load_colmap_image`` has always done it."""
     import cv2
     path = image_dir / entry.image_name
-    # IMREAD_COLOR collapses grayscale/alpha sources to 3-channel 8-bit BGR.
-    flags = cv2.IMREAD_IGNORE_ORIENTATION | (
-        cv2.IMREAD_UNCHANGED if load_alpha else cv2.IMREAD_COLOR)
+    flags = _image_flags(load_alpha)
     array = cv2.imread(str(path), flags)
     if array is None and path.exists():
         # cv2.imread uses the ANSI file API on Windows; decode the bytes for non-code-page paths.
@@ -396,7 +394,37 @@ def load_colmap_image_native(entry: ColmapImageEntry, image_dir: Path, width: in
         if not path.exists():
             raise FileNotFoundError(f"image not found: {path}")
         raise OSError(f"failed to decode image: {path}")
+    return _to_rgb_at_size(array, path, width, height, load_alpha)
 
+
+def read_colmap_image_bytes(entry: ColmapImageEntry, image_dir: Path) -> np.ndarray:
+    """The image file of ``entry`` as it is on disk (uint8 bytes), for ``decode_colmap_image``."""
+    path = image_dir / entry.image_name
+    if not path.is_file():
+        raise FileNotFoundError(f"image not found: {path}")
+    return np.fromfile(path, dtype=np.uint8)
+
+
+def decode_colmap_image(data: np.ndarray, name: str | Path, width: int, height: int,
+                        load_alpha: bool = False) -> np.ndarray:
+    """``load_colmap_image_native`` from the file's bytes (``read_colmap_image_bytes``):
+    the same decoder flags, channel order and resize."""
+    import cv2
+    array = cv2.imdecode(data, _image_flags(load_alpha))
+    if array is None:
+        raise OSError(f"failed to decode image: {name}")
+    return _to_rgb_at_size(array, name, width, height, load_alpha)
+
+
+def _image_flags(load_alpha: bool) -> int:
+    import cv2
+    # IMREAD_COLOR collapses grayscale/alpha sources to 3-channel 8-bit BGR.
+    return cv2.IMREAD_IGNORE_ORIENTATION | (cv2.IMREAD_UNCHANGED if load_alpha else cv2.IMREAD_COLOR)
+
+
+def _to_rgb_at_size(array: np.ndarray, path, width: int, height: int,
+                    load_alpha: bool) -> np.ndarray:
+    import cv2
     channels = 1 if array.ndim == 2 else array.shape[2]
     if load_alpha and channels == 4:
         array = cv2.cvtColor(array, cv2.COLOR_BGRA2RGBA)

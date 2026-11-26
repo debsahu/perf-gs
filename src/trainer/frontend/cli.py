@@ -270,6 +270,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "where that is unavailable. --max-splats is lowered "
                          "(with a warning) when it would not fit.")
     _shared(parser, "image_residency")
+    parser.add_argument("--target-prefetch", type=int, default=4,
+                    help="with --image-residency compressed: decode the next N sampled "
+                         "training views ahead on background threads (default: 4). "
+                         "Each decoded view costs width x height x 4 bytes of host RAM.")
     _shared(parser, "adam_moments")
     _shared(parser, "splat_kernel")
     _shared(parser, "splat_profile_power")

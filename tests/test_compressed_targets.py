@@ -243,6 +243,21 @@ def test_prefetch_decodes_ahead_in_order_and_pins(tmp_path):
     assert targets.cache_stats()["cached"] <= 1 + 2
 
 
+def test_stats_time_decodes_and_training_waits(tmp_path):
+    """decode_s sums the decodes; wait_s counts only time a reader blocked on a view not yet decoded."""
+    targets, _ = _counting(tmp_path, n=4, cache_views=4, decode_workers=1)
+    inner = targets._cache._decode
+    targets._cache._decode = lambda i: time.sleep(0.05) or inner(i)
+    targets.prefetch([0, 1])
+    time.sleep(0.3)                          # both decoded ahead: reading them does not wait
+    _ = targets.resident[0], targets.resident[1]
+    stats = targets.cache_stats()
+    assert stats["wait_s"] < 0.02 and stats["waits"] == 0 and stats["decode_s"] >= 0.1
+    _ = targets.resident[2]                  # not prefetched: the reader decodes it and waits
+    stats = targets.cache_stats()
+    assert stats["waits"] == 1 and stats["wait_s"] >= 0.05
+
+
 def test_concurrent_reads_decode_once(tmp_path):
     targets, log = _counting(tmp_path, n=4, cache_views=4)
     from concurrent.futures import ThreadPoolExecutor

@@ -108,7 +108,8 @@ class _DecodeCache:
         self._cached: OrderedDict[int, tuple] = OrderedDict()
         self._flight: dict[int, Future] = {}
         self._pinned: set[int] = set()
-        self.hits = self.misses = self.decodes = self.peak_cached = 0
+        self.hits = self.misses = self.decodes = self.peak_cached = self.waits = 0
+        self.wait_s = self.decode_s = 0.0
 
     def get(self, index: int) -> tuple:
         with self._lock:
@@ -122,9 +123,15 @@ class _DecodeCache:
             if owner:
                 future = self._flight[index] = Future()
             self.misses += 1
+        # A miss means the reader blocks until the view is decoded: that time is what prefetch hides.
+        started = time.perf_counter()
         if owner:
             self._run(index, future)
-        return future.result()
+        entry = future.result()
+        with self._lock:
+            self.waits += 1
+            self.wait_s += time.perf_counter() - started
+        return entry
 
     def prefetch(self, indices: Iterable[int]) -> None:
         window = list(dict.fromkeys(int(i) for i in indices))
@@ -143,6 +150,7 @@ class _DecodeCache:
             self._pool.submit(self._run, index, future)
 
     def _run(self, index: int, future: Future) -> None:
+        started = time.perf_counter()
         try:
             entry = self._decode(index)
         except BaseException as error:          # surfaces on the reader
@@ -153,6 +161,7 @@ class _DecodeCache:
         with self._lock:
             self._flight.pop(index, None)
             self.decodes += 1
+            self.decode_s += time.perf_counter() - started
             self._cached[index] = entry
             self._cached.move_to_end(index)
             self._evict()
@@ -172,7 +181,8 @@ class _DecodeCache:
         with self._lock:
             return {"cached": len(self._cached), "peak_cached": self.peak_cached,
                     "capacity": self.capacity, "pinned": len(self._pinned),
-                    "hits": self.hits, "misses": self.misses, "decodes": self.decodes}
+                    "hits": self.hits, "misses": self.misses, "decodes": self.decodes,
+                    "decode_s": self.decode_s, "waits": self.waits, "wait_s": self.wait_s}
 
     def close(self) -> None:
         if self._pool is not None:

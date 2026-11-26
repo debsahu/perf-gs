@@ -2,8 +2,11 @@
 
 // L1 (+ optional L2) photometric loss gradient with optional alpha supervision, in sRGB as in 3DGS.
 // Sum-over-pixels convention (no 1/N), matching the backward rasterizer's accumulation.
+// LOSS_MASK: target.a is a per-pixel keep mask (1 keep, 0 drop), so the color gradient is gated by
+// it and alpha supervision is off (the host refuses --w-alpha with --masks).
 
 #include "../common/stbn.slang"
+#include "../common/loss_mask.slang"
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -45,12 +48,16 @@ void computeLossGrad(
         grad_rgb += lambda_l2 * 2.0 * diff;          // + lambda_l2 * d/dC (C-T)^2
 
     float grad_alpha = 0.0;
+#if LOSS_MASK
+    grad_rgb *= target.a;
+#else
     if (w_alpha > 0.0)
     {
         float A_rendered = rendered.a;
         float A_target = target.a;
         grad_alpha = w_alpha * sign(A_rendered - A_target);
     }
+#endif
 
     dL_dC[p] = float4(grad_rgb * stbn_scale, grad_alpha * stbn_scale);
 }

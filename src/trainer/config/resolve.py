@@ -44,6 +44,7 @@ def shader_specialization(args: argparse.Namespace) -> ShaderSpecialization:
         splat_kernel=SplatKernel(args.splat_kernel),
         splat_profile_power=float(args.splat_profile_power),
         splat_profile_onset=float(args.splat_profile_onset),
+        loss_mask=bool(getattr(args, "masks", None)),
     )
 
 

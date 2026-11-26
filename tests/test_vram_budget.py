@@ -181,7 +181,7 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str) -> np.ndarray:
         app.pipeline.runtime.wait_for_idle()
         memory = app._report_memory()
         ram, cache = memory["host_ram"], memory["gpu_view_cache"]
-        assert ram["decoded_images_bytes"] == 4 * 16 * 16 * 3 * 4
+        assert ram["decoded_images_bytes"] == 4 * 16 * 16 * 4      # u8_targets.patch: uint8 RGBA, not float RGB
         assert ram["linear_cache_bytes"] == 0
         packed_bytes = 2 * 16 * 16 * 4
         if residency == "stream":

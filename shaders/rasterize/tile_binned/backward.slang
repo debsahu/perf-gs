@@ -54,22 +54,22 @@ void backwardRasterize(
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
     RWTexture2D<float4> dL_dC_texture,
-    RWStructuredBuffer<int64_t> grad_mean_x,
-    RWStructuredBuffer<int64_t> grad_mean_y,
-    RWStructuredBuffer<int64_t> grad_mean_z,
-    RWStructuredBuffer<int64_t> grad_log_scale_x,
-    RWStructuredBuffer<int64_t> grad_log_scale_y,
-    RWStructuredBuffer<int64_t> grad_log_scale_z,
-    RWStructuredBuffer<int64_t> grad_rot_w,
-    RWStructuredBuffer<int64_t> grad_rot_x,
-    RWStructuredBuffer<int64_t> grad_rot_y,
-    RWStructuredBuffer<int64_t> grad_rot_z,
-    RWStructuredBuffer<int64_t> grad_opacity,
-    RWStructuredBuffer<int64_t> grad_color_r,
-    RWStructuredBuffer<int64_t> grad_color_g,
-    RWStructuredBuffer<int64_t> grad_color_b,
-    RWStructuredBuffer<int64_t> grad_2d_x_iter,
-    RWStructuredBuffer<int64_t> grad_2d_y_iter)
+    RWStructuredBuffer<I64Atomic> grad_mean_x,
+    RWStructuredBuffer<I64Atomic> grad_mean_y,
+    RWStructuredBuffer<I64Atomic> grad_mean_z,
+    RWStructuredBuffer<I64Atomic> grad_log_scale_x,
+    RWStructuredBuffer<I64Atomic> grad_log_scale_y,
+    RWStructuredBuffer<I64Atomic> grad_log_scale_z,
+    RWStructuredBuffer<I64Atomic> grad_rot_w,
+    RWStructuredBuffer<I64Atomic> grad_rot_x,
+    RWStructuredBuffer<I64Atomic> grad_rot_y,
+    RWStructuredBuffer<I64Atomic> grad_rot_z,
+    RWStructuredBuffer<I64Atomic> grad_opacity,
+    RWStructuredBuffer<I64Atomic> grad_color_r,
+    RWStructuredBuffer<I64Atomic> grad_color_g,
+    RWStructuredBuffer<I64Atomic> grad_color_b,
+    RWStructuredBuffer<I64Atomic> grad_2d_x_iter,
+    RWStructuredBuffer<I64Atomic> grad_2d_y_iter)
 {
     uint2 pixel = dtid.xy;
     uint tid = gtid.y * TILE_WIDTH + gtid.x;
@@ -266,22 +266,22 @@ void backwardRasterize(
         {
             float v = gs_atomic[tid];
             int64_t fx = toFixed(v);
-            if      (tid == 0)  InterlockedAdd(grad_opacity[g_idx],     fx);
-            else if (tid == 1)  InterlockedAdd(grad_color_r[g_idx],     fx);
-            else if (tid == 2)  InterlockedAdd(grad_color_g[g_idx],     fx);
-            else if (tid == 3)  InterlockedAdd(grad_color_b[g_idx],     fx);
-            else if (tid == 4)  InterlockedAdd(grad_2d_x_iter[g_idx],   fx);
-            else if (tid == 5)  InterlockedAdd(grad_2d_y_iter[g_idx],   fx);
-            else if (tid == 6)  InterlockedAdd(grad_mean_x[g_idx],      fx);
-            else if (tid == 7)  InterlockedAdd(grad_mean_y[g_idx],      fx);
-            else if (tid == 8)  InterlockedAdd(grad_mean_z[g_idx],      fx);
-            else if (tid == 9)  InterlockedAdd(grad_log_scale_x[g_idx], fx);
-            else if (tid == 10) InterlockedAdd(grad_log_scale_y[g_idx], fx);
-            else if (tid == 11) InterlockedAdd(grad_log_scale_z[g_idx], fx);
-            else if (tid == 12) InterlockedAdd(grad_rot_w[g_idx],       fx);
-            else if (tid == 13) InterlockedAdd(grad_rot_x[g_idx],       fx);
-            else if (tid == 14) InterlockedAdd(grad_rot_y[g_idx],       fx);
-            else if (tid == 15) InterlockedAdd(grad_rot_z[g_idx],       fx);
+            if      (tid == 0)  atomicAdd64(grad_opacity, g_idx,     fx);
+            else if (tid == 1)  atomicAdd64(grad_color_r, g_idx,     fx);
+            else if (tid == 2)  atomicAdd64(grad_color_g, g_idx,     fx);
+            else if (tid == 3)  atomicAdd64(grad_color_b, g_idx,     fx);
+            else if (tid == 4)  atomicAdd64(grad_2d_x_iter, g_idx,   fx);
+            else if (tid == 5)  atomicAdd64(grad_2d_y_iter, g_idx,   fx);
+            else if (tid == 6)  atomicAdd64(grad_mean_x, g_idx,      fx);
+            else if (tid == 7)  atomicAdd64(grad_mean_y, g_idx,      fx);
+            else if (tid == 8)  atomicAdd64(grad_mean_z, g_idx,      fx);
+            else if (tid == 9)  atomicAdd64(grad_log_scale_x, g_idx, fx);
+            else if (tid == 10) atomicAdd64(grad_log_scale_y, g_idx, fx);
+            else if (tid == 11) atomicAdd64(grad_log_scale_z, g_idx, fx);
+            else if (tid == 12) atomicAdd64(grad_rot_w, g_idx,       fx);
+            else if (tid == 13) atomicAdd64(grad_rot_x, g_idx,       fx);
+            else if (tid == 14) atomicAdd64(grad_rot_y, g_idx,       fx);
+            else if (tid == 15) atomicAdd64(grad_rot_z, g_idx,       fx);
         }
 
         GroupMemoryBarrierWithGroupSync();

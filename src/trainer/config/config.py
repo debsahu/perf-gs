@@ -153,6 +153,9 @@ class ShaderSpecialization:
     splat_kernel: SplatKernel = SplatKernel.GAUSSIAN
     splat_profile_power: float = 1.0
     splat_profile_onset: float = 0.0
+    # Per-image loss masks ride in the target's alpha (--masks): LOSS_MASK gates every per-pixel
+    # training signal by it and turns alpha supervision off.
+    loss_mask: bool = False
 
 
 @dataclass(frozen=True)

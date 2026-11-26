@@ -184,12 +184,14 @@ void accumulateLevel(
     accum[p] = a;
 }
 
-// Final aggregation: S-bar = num / (den + MIN_ENERGY).
+// Final aggregation: S-bar = num / (den + MIN_ENERGY). The source's alpha is carried into .w:
+// with --masks it is the keep mask, which the structure-aware score reads (.xyz never depends on it).
 [shader("compute")]
 [numthreads(16, 16, 1)]
 void finalize(
     uint3 dtid: SV_DispatchThreadID,
     RWTexture2D<float4> accum,
+    RWTexture2D<float4> source,
     RWTexture2D<float4> fieldOut,
     uniform uint2 dim,
     uniform float min_energy)
@@ -197,5 +199,5 @@ void finalize(
     uint2 p = dtid.xy;
     if (p.x >= dim.x || p.y >= dim.y) return;
     float4 a = accum[p];
-    fieldOut[p] = float4(a.xyz / (a.w + min_energy), 0.0);
+    fieldOut[p] = float4(a.xyz / (a.w + min_energy), source[p].a);
 }

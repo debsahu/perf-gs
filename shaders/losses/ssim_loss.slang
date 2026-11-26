@@ -2,9 +2,16 @@
 
 #include "../common/types.slang"
 #include "../common/stbn.slang"
+#include "../common/loss_mask.slang"
 
 // SSIM over an 11x11 Gaussian window (sigma 1.5, zero padding) as in 3DGS. Separable and LDS-tiled:
 // a 16x16 group stages its tile plus a 5-texel apron (26x26), row-filters it, then column-filters.
+//
+// LOSS_MASK (target.a = keep mask): the SSIM term sums only windows CENTERED on kept pixels (pass 1
+// zeroes a dropped center's back-projection maps), and pass 2 zeroes the whole color gradient of a
+// dropped pixel. Edge approximation: a kept window within 5 px of the mask boundary still reads the
+// dropped pixels' rendered and target values in its mean and variance. Those pixels get no gradient,
+// so the window can only move kept pixels, but its statistics are not those of the kept set alone.
 
 static const int WINDOW_RADIUS = 5;
 static const int WINDOW = 2 * WINDOW_RADIUS + 1;
@@ -150,6 +157,12 @@ void ssimComputeMaps(
     float3 m1 = (dS_dmux - 2.0 * mu_x * dS_dsx2 - mu_y * dS_dsxy) * inv_w;
     float3 m2 = (2.0 * dS_dsx2) * inv_w;
     float3 m3 = (dS_dsxy) * inv_w;
+#if LOSS_MASK
+    float keep_center = target_image[p].a;   // only windows centered on kept pixels count
+    m1 *= keep_center;
+    m2 *= keep_center;
+    m3 *= keep_center;
+#endif
 
     ssim_m1[p] = float4(m1, 0.0);
     ssim_m2[p] = float4(m2, 0.0);
@@ -263,8 +276,12 @@ void ssimGradient(
         grad_rgb += lambda_l2 * 2.0 * (x - y);
 
     float grad_alpha = 0.0;
+#if LOSS_MASK
+    grad_rgb *= target.a;
+#else
     if (w_alpha > 0.0)
         grad_alpha = w_alpha * sign(rendered.a - target.a);
+#endif
 
     dL_dC[p] = float4(grad_rgb * stbn_scale, grad_alpha * stbn_scale);
 }

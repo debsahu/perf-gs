@@ -104,6 +104,10 @@ class TrainingPipeline:
         self.runtime = GpuRuntime(device, self.gpu_lock)
         self.commands = CommandRecorder(self.runtime)
         self.kernels = KernelLibrary(device, self.slang_session)
+        # LOSS_MASK is compiled in (factory.shader_defines); the kernels that read the mask then
+        # take the active target texture as an extra argument, so this must match the session.
+        defines = self.slang_session.desc.compiler_options.defines or {}
+        self.loss_mask = bool(defines.get("LOSS_MASK"))
         self.width = width
         self.height = height
         self.max_splats = max_splats
@@ -307,8 +311,12 @@ class TrainingPipeline:
                          target=self.targets.active,
                          stbn_kwargs=self._stbn_kwargs(contextual))
 
+    def loss_mask_kwargs(self) -> dict:
+        """The active target as ``loss_mask`` (its alpha is the keep mask) when masks are on."""
+        return {"loss_mask": self.targets.active} if self.loss_mask else {}
+
     def record_backward(self, contextual: IterationContextualVariables) -> None:
-        self.backward.record(contextual, self._stbn_kwargs(contextual))
+        self.backward.record(contextual, self._stbn_kwargs(contextual), self.loss_mask_kwargs())
         variables = contextual.densification_variables
         if variables is not None and variables.structure_tensor_texture is not None:
             structure = variables.structure_tensor_texture

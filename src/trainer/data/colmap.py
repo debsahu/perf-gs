@@ -375,6 +375,14 @@ def load_colmap_image(entry: ColmapImageEntry, image_dir: Path, width: int, heig
     (H, W, 4) when ``load_alpha`` and the image has alpha, else (H, W, 3). EXIF
     orientation is ignored: rotating would disagree with the COLMAP intrinsics.
     """
+    return to_float01(load_colmap_image_native(entry, image_dir, width, height, load_alpha))
+
+
+def load_colmap_image_native(entry: ColmapImageEntry, image_dir: Path, width: int, height: int,
+                             load_alpha: bool = False) -> np.ndarray:
+    """``load_colmap_image`` before its float conversion: RGB(A) at (width, height) in the
+    source's own integer dtype (uint8 for 8-bit images). Any resize happens here, in that
+    dtype, exactly as ``load_colmap_image`` has always done it."""
     import cv2
     path = image_dir / entry.image_name
     # IMREAD_COLOR collapses grayscale/alpha sources to 3-channel 8-bit BGR.
@@ -407,6 +415,57 @@ def load_colmap_image(entry: ColmapImageEntry, image_dir: Path, width: int, heig
         array = cv2.resize(array, (width, height),
                            interpolation=cv2.INTER_AREA if shrinking
                            else cv2.INTER_LINEAR)
+    return array
+
+
+def find_mask_path(mask_dir: Path, image_name: str) -> Path | None:
+    """The loss mask of ``image_name``: ``<mask_dir>/<image name>.png``, else ``<mask_dir>/<stem>.png``.
+    Subfolders of the image name are kept in both forms. None when neither file exists."""
+    name = Path(image_name)
+    for candidate in (mask_dir / name.parent / f"{name.name}.png",
+                      mask_dir / name.parent / f"{name.stem}.png"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_mask_file(path: Path, width: int, height: int, invert: bool = False) -> np.ndarray:
+    """A loss mask as uint8 (H, W): 255 = keep the pixel, 0 = drop it.
+
+    The file is read as grayscale and inverted first when ``invert`` (for 255 = drop masks).
+    Resizing averages the keep fraction of each output pixel (area resampling when shrinking,
+    nearest when enlarging) and then thresholds it at one half. A mask is a gate, not a weight:
+    a boundary pixel that is mostly dropped content still carries that content's color, so
+    giving it a partial weight would keep training on what the mask removes. Ties keep."""
+    import cv2
+    flags = cv2.IMREAD_GRAYSCALE | cv2.IMREAD_IGNORE_ORIENTATION
+    array = cv2.imread(str(path), flags)
+    if array is None and path.exists():
+        array = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
+    if array is None:
+        raise OSError(f"failed to decode mask: {path}")
+    keep = array.astype(np.float32) * (1.0 / 255.0)
+    if invert:
+        keep = 1.0 - keep
+    if (keep.shape[1], keep.shape[0]) != (width, height):
+        shrinking = width <= keep.shape[1] and height <= keep.shape[0]
+        keep = cv2.resize(keep, (width, height),
+                          interpolation=cv2.INTER_AREA if shrinking else cv2.INTER_NEAREST)
+    return np.where(keep >= 0.5, np.uint8(255), np.uint8(0))
+
+
+def load_colmap_mask(entry: ColmapImageEntry, mask_dir: Path, width: int, height: int,
+                     invert: bool = False) -> np.ndarray | None:
+    """``load_mask_file`` for an image's mask, or None when the image has none."""
+    path = find_mask_path(Path(mask_dir), entry.image_name)
+    return None if path is None else load_mask_file(path, width, height, invert)
+
+
+def to_float01(array: np.ndarray) -> np.ndarray:
+    """The float32 [0, 1] form ``load_colmap_image`` returns, from a decoded integer image.
+    For uint8, ``rint(to_float01(u8) * 255) == u8`` on all 256 values, so a packed
+    rgba8 target can be made from the uint8 decode directly."""
+    import cv2
     # cv2.multiply frees the GIL numpy's cast holds; a bare scalar would only scale channel 0.
     if array.dtype.kind in "ui":
         scale = 1.0 / float(np.iinfo(array.dtype).max)

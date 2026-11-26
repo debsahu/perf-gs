@@ -21,6 +21,14 @@ def psnr(rendered: np.ndarray, target: np.ndarray) -> float:
     return -10.0 * math.log10(mse)
 
 
+def psnr_masked(rendered: np.ndarray, target: np.ndarray, keep: np.ndarray | None) -> float | None:
+    """PSNR over the pixels a loss mask keeps (``keep``: boolean HxW), as Brush reports it:
+    the MSE is averaged over kept pixels only. None without a mask or with no kept pixel."""
+    if keep is None or not keep.any():
+        return None
+    return psnr(rendered[keep], target[keep])
+
+
 def ssim_gaussian_window(window_size: int = 11, sigma: float = 1.5) -> np.ndarray:
     """Normalized 1D Gaussian window, matching the 3DGS / SAD-GS SSIM."""
     coords = np.arange(window_size) - window_size // 2

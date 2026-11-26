@@ -38,6 +38,8 @@ def shader_defines(spec: ShaderSpecialization) -> dict[str, str] | None:
         defines["SPLAT_PROFILE_POWER"] = repr(float(spec.splat_profile_power))
     if spec.splat_profile_onset != 0.0:
         defines["SPLAT_PROFILE_ONSET"] = repr(float(spec.splat_profile_onset))
+    if spec.loss_mask:
+        defines["LOSS_MASK"] = "1"
     return defines or None
 
 

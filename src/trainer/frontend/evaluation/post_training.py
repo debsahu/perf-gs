@@ -14,7 +14,7 @@ import numpy as np
 
 from trainer.common.color import srgb_to_linear as _srgb_to_linear
 from trainer.backend.export import save_ply
-from trainer.common.metrics import psnr as _psnr_image, ssim as _ssim_image
+from trainer.common.metrics import psnr as _psnr_image, psnr_masked as _psnr_masked, ssim as _ssim_image
 from trainer.frontend.evaluation.evaluation import render_all_cameras
 from trainer.frontend.evaluation.psnr_plot import write_psnr_curve
 from trainer.frontend.run_control import Checkpoint, uninterrupted
@@ -43,6 +43,7 @@ def run_post_training(
     psnr_curve: list[dict] | None = None,
     progress: Callable[[str, float], None] = lambda _label, _fraction: None,
     checkpoint: Checkpoint = uninterrupted,
+    keep_masks: Sequence[np.ndarray | None] | None = None,
 ) -> None:
 
     checkpoint()
@@ -114,6 +115,10 @@ def run_post_training(
                 "psnr_srgb_masked": (_psnr_image(r_srgb[mask], t_srgb[mask])
                                     if mask.sum() > 0 else 0.0),
             })
+            if keep_masks is not None:
+                # Over the loss mask's kept pixels; None when a view keeps no pixel.
+                per_cam[-1]["psnr_srgb_lossmask"] = _psnr_masked(r_srgb, t_srgb, keep_masks[cam_i])
+                per_cam[-1]["lossmask_coverage"] = float(keep_masks[cam_i].mean())
 
             checkpoint()
         test_set = set(test_indices)
@@ -153,6 +158,13 @@ def run_post_training(
             "train_it_per_s": completed_iters / max(train_wall_s, 1e-9),
             "final_n_gaussians": pipeline.primitives.count(),
         }
+        if keep_masks is not None:
+            def mean_lossmask(cams):
+                values = [c["psnr_srgb_lossmask"] for c in cams if c["psnr_srgb_lossmask"] is not None]
+                return float(np.mean(values)) if values else None
+            summary["psnr_srgb_lossmask"] = mean_lossmask(test_cams)
+            summary["train_psnr_srgb_lossmask"] = mean_lossmask(train_cams)
+            summary["lossmask_coverage"] = mean_metric(test_cams, "lossmask_coverage")
         (run_dir / "final_psnr.json").write_text(json.dumps(summary, indent=2))
 
         if args.eval_holdout:
@@ -169,6 +181,9 @@ def run_post_training(
             print(f"SSIM sRGB (paper):       {summary['ssim_srgb']:6.4f}     "
                 f"<- mean of per-image SSIM over all {n_cams} views")
         print(f"PSNR sRGB masked:        {summary['psnr_srgb_masked']:6.2f} dB  <- honest silhouette (test split)")
+        if summary.get("psnr_srgb_lossmask") is not None:
+            print(f"PSNR sRGB loss-masked:   {summary['psnr_srgb_lossmask']:6.2f} dB  <- kept pixels of "
+                  f"--masks only (test split, coverage {100.0 * summary['lossmask_coverage']:.1f}%)")
         print(f"PSNR linear:             {summary['psnr_linear']:6.2f} dB  (test split, mean per-image)")
         print(f"  [legacy dB-of-mean-MSE, all cams: {summary['all_psnr_srgb_db_of_mean_mse']:.2f} dB — NOT the paper metric]")
         print(f"final gaussian count:    {summary['final_n_gaussians']}")

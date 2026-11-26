@@ -16,7 +16,8 @@ static const uint RADIX_LOG = 8u;
 static const uint US_DIM = 128u;
 static const uint SCAN_DIM = 128u;
 
-// Downsweep sizes are shared with the host; the 1D dispatch limit caps n at 65535 * PART_SIZE.
+// Downsweep sizes are shared with the host. Groups run along X only, so n is capped at the DEVICE's
+// maxComputeWorkGroupCount[0] * PART_SIZE (validation.max_sort_pairs_limit; the spec minimum is 65535).
 #include "common/execution.slang"
 static const uint D_DIM = RADIX_DIGITS;
 static const uint KEYS_PER_THREAD = RADIX_KEYS_PER_THREAD;

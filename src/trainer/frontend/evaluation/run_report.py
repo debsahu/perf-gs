@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from trainer.backend.memory.budget import allocated_bytes
-from trainer.common.metrics import psnr as psnr_image, ssim as ssim_image
+from trainer.common.metrics import psnr as psnr_image, psnr_masked, ssim as ssim_image
 from trainer.frontend.run_control import Checkpoint, uninterrupted
 
 if TYPE_CHECKING:
@@ -168,6 +168,7 @@ def evaluate_test_views(
     with_lpips: bool = False,
     progress: Callable[[int, int], None] = lambda _d, _t: None,
     checkpoint: Checkpoint = uninterrupted,
+    keep_masks: Sequence[np.ndarray | None] | None = None,
 ) -> tuple[list[dict], dict]:
     """Per-view PSNR/SSIM over the held-out split, optionally dumping renders.
     Metrics use the float render, not the PNG, so the 8-bit round trip cannot move a score."""
@@ -201,6 +202,9 @@ def evaluate_test_views(
             "width": int(rendered.shape[1]),
             **_overdraw(pipeline, image[..., 3]),
         }
+        if keep_masks is not None:
+            record["psnr_srgb_lossmask"] = psnr_masked(rendered, target, keep_masks[cam_i])
+            record["lossmask_coverage"] = float(keep_masks[cam_i].mean())
         # Same float render as PSNR/SSIM, so all three metrics describe one image.
         record["lpips"] = (perceptual.lpips(rendered, target)
                                 if lpips_ready else None)
@@ -237,6 +241,10 @@ def evaluate_test_views(
                              if r.get("lpips") is not None),
         "renders_dir": (str(render_dir) if render_dir is not None else None),
     }
+    if keep_masks is not None:
+        # Over the --masks kept pixels only; psnr_srgb counts every pixel.
+        summary["psnr_srgb_lossmask"] = _mean("psnr_srgb_lossmask")
+        summary["lossmask_coverage"] = _mean("lossmask_coverage")
     if with_lpips:
         from trainer.common import perceptual
         summary["lpips_backend"] = perceptual.availability()

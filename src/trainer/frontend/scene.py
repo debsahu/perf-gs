@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 
@@ -77,7 +78,11 @@ def load_scene_context(args: argparse.Namespace, prepared: ColmapDataset | None 
     if getattr(args, "stereo_init", False) and initial_count < args.max_splats:
         from trainer.data.stereo import DEFAULT_SEED_LIMIT, seed_from_stereo
         limit = min(DEFAULT_SEED_LIMIT, args.max_splats - initial_count)
-        initial_count += seed_from_stereo(colmap_scene, train_indices, limit=limit)
+        masks = getattr(args, "masks", None)
+        # Loss masks drop seeds on masked pixels; without them the call is unchanged.
+        mask_kwargs = ({"masks_dir": Path(masks), "invert_masks": bool(getattr(args, "invert_masks", False))}
+                       if masks else {})
+        initial_count += seed_from_stereo(colmap_scene, train_indices, limit=limit, **mask_kwargs)
     if args.eval_holdout:
         print(f"[eval] holdout protocol ON (stride={stride}): "
               f"{len(train_indices)} train / {len(test_indices)} test cameras. "

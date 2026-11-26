@@ -16,7 +16,9 @@ def accumulate_removal_cost(pipeline, step: int, hardness: float) -> None:
         tile_start=raster.tile_start.storage, sorted_ids=pipeline.rasterizer.sorted_values.storage,
         processed=raster.gaussian_count_per_pixel, image=raster.output_image,
         scores=pipeline.buffers.densification.blend_weight.storage,
-        phase=(13 * step) % 16, hardness=hardness)
+        phase=(13 * step) % 16, hardness=hardness,
+        # Under LOSS_MASK a dropped pixel is not replayed: it cannot vouch for a splat.
+        **pipeline.loss_mask_kwargs())
 
 
 def prune_by_removal_cost(pipeline, fraction: float) -> dict[str, int]:

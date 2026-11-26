@@ -342,3 +342,66 @@ def test_cli_accepts_compressed_residency():
     args = parse_args(["--image-residency", "compressed", "--target-prefetch", "6"])
     assert args.image_residency == "compressed" and args.target_prefetch == 6
     assert parse_args([]).image_residency == "stream" and parse_args([]).target_prefetch == 4
+
+
+def test_failed_decode_clears_flight_and_retries(tmp_path):
+    """A decode that raises surfaces on the reader, leaves nothing in flight, and the next read decodes again."""
+    targets, log = _counting(tmp_path, n=3, cache_views=2)
+    inner = targets._cache._decode
+    fail = [True]
+
+    def flaky(index):
+        if fail[0]:
+            fail[0] = False
+            raise OSError("disk hiccup")
+        return inner(index)
+    targets._cache._decode = flaky
+    with pytest.raises(OSError, match="disk hiccup"):
+        _ = targets.resident[1]
+    assert targets._cache._flight == {}
+    assert targets.resident[1].shape == (H, W, 4)
+    assert targets.cache_stats()["decodes"] == 1
+
+
+def test_packing_runs_on_the_decode_worker(tmp_path):
+    """Prefetched views are packed on the worker thread, so the training thread only binds the result."""
+    scene = _scene(tmp_path, "png16")
+    targets = TargetDataset(scene, W, H, use_alpha=True, residency="compressed", decode_workers=1)
+    pack = _pack()
+    threads = []
+    views = CompressedTargetViews(targets, lambda image: threads.append(threading.current_thread().name) or pack(image))
+    views.prefetch([0, 1])
+    deadline = time.time() + 10
+    while targets.cache_stats()["cached"] < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    before = list(threads)
+    assert len(before) == 2 and all(t.startswith("target-decode") for t in before), before
+    assert views[0].dtype == np.uint8 and views[1].dtype == np.uint8
+    assert threads == before                  # reading a prefetched view packs nothing on this thread
+
+
+def test_close_fails_pending_reads_instead_of_hanging(tmp_path):
+    """close() cancels queued decodes; a reader waiting on one gets an error, never a hang."""
+    targets, _ = _counting(tmp_path, n=6, cache_views=2, decode_workers=1)
+    inner = targets._cache._decode
+    gate = threading.Event()
+    targets._cache._decode = lambda i: gate.wait(5) and inner(i)
+    targets.prefetch([0, 1, 2])             # 0 runs (blocked on the gate), 1 and 2 stay queued
+    time.sleep(0.05)
+    result = {}
+
+    def read():
+        try:
+            result["value"] = targets.resident[2]
+        except Exception as error:            # noqa: BLE001
+            result["error"] = error
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    time.sleep(0.05)
+    targets.close()
+    reader.join(2)
+    gate.set()
+    assert not reader.is_alive(), "get() hung after close()"
+    assert isinstance(result.get("error"), RuntimeError)
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = targets.resident[4]

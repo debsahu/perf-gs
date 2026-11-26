@@ -108,11 +108,14 @@ class _DecodeCache:
         self._cached: OrderedDict[int, tuple] = OrderedDict()
         self._flight: dict[int, Future] = {}
         self._pinned: set[int] = set()
+        self._closed = False
         self.hits = self.misses = self.decodes = self.peak_cached = self.waits = 0
         self.wait_s = self.decode_s = 0.0
 
     def get(self, index: int) -> tuple:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("the target decode cache is closed")
             entry = self._cached.get(index)
             if entry is not None:
                 self._cached.move_to_end(index)
@@ -137,6 +140,8 @@ class _DecodeCache:
         window = list(dict.fromkeys(int(i) for i in indices))
         submit = []
         with self._lock:
+            if self._closed:
+                return
             self._pinned = set(window)
             for index in window:
                 if index in self._cached or index in self._flight:
@@ -156,17 +161,20 @@ class _DecodeCache:
         except BaseException as error:          # surfaces on the reader
             with self._lock:
                 self._flight.pop(index, None)
-            future.set_exception(error)
+                if not future.done():               # close() may have failed it already
+                    future.set_exception(error)
             return
         with self._lock:
             self._flight.pop(index, None)
+            if future.done():                       # failed by close() while decoding
+                return
             self.decodes += 1
             self.decode_s += time.perf_counter() - started
             self._cached[index] = entry
             self._cached.move_to_end(index)
             self._evict()
             self.peak_cached = max(self.peak_cached, len(self._cached))
-        future.set_result(entry)
+            future.set_result(entry)
 
     def _evict(self) -> None:
         unpinned = [i for i in self._cached if i not in self._pinned]
@@ -185,9 +193,19 @@ class _DecodeCache:
                     "decode_s": self.decode_s, "waits": self.waits, "wait_s": self.wait_s}
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-            self._pool = None
+        """Stop decoding. Queued decodes are cancelled, and every reader still waiting on one gets
+        a RuntimeError instead of waiting forever; later reads raise too."""
+        with self._lock:
+            self._closed = True
+            pending = list(self._flight.values())
+            self._flight.clear()
+            self._cached.clear()
+            for future in pending:
+                if not future.done():
+                    future.set_exception(RuntimeError("the target decode cache was closed"))
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 class _LazyColumn(Sequence):

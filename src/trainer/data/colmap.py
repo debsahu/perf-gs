@@ -375,6 +375,14 @@ def load_colmap_image(entry: ColmapImageEntry, image_dir: Path, width: int, heig
     (H, W, 4) when ``load_alpha`` and the image has alpha, else (H, W, 3). EXIF
     orientation is ignored: rotating would disagree with the COLMAP intrinsics.
     """
+    return to_float01(load_colmap_image_native(entry, image_dir, width, height, load_alpha))
+
+
+def load_colmap_image_native(entry: ColmapImageEntry, image_dir: Path, width: int, height: int,
+                             load_alpha: bool = False) -> np.ndarray:
+    """``load_colmap_image`` before its float conversion: RGB(A) at (width, height) in the
+    source's own integer dtype (uint8 for 8-bit images). Any resize happens here, in that
+    dtype, exactly as ``load_colmap_image`` has always done it."""
     import cv2
     path = image_dir / entry.image_name
     # IMREAD_COLOR collapses grayscale/alpha sources to 3-channel 8-bit BGR.
@@ -407,6 +415,14 @@ def load_colmap_image(entry: ColmapImageEntry, image_dir: Path, width: int, heig
         array = cv2.resize(array, (width, height),
                            interpolation=cv2.INTER_AREA if shrinking
                            else cv2.INTER_LINEAR)
+    return array
+
+
+def to_float01(array: np.ndarray) -> np.ndarray:
+    """The float32 [0, 1] form ``load_colmap_image`` returns, from a decoded integer image.
+    For uint8, ``rint(to_float01(u8) * 255) == u8`` on all 256 values, so a packed
+    rgba8 target can be made from the uint8 decode directly."""
+    import cv2
     # cv2.multiply frees the GIL numpy's cast holds; a bare scalar would only scale channel 0.
     if array.dtype.kind in "ui":
         scale = 1.0 / float(np.iinfo(array.dtype).max)

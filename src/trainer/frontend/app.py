@@ -421,7 +421,9 @@ class TrainingApplication:
         Packing runs on a thread pool but uploads stay on this thread: the device queue is
         shared with the viewer under ``gpu_lock`` and is not thread-safe."""
         pipeline = self._pipeline
-        targets = self._targets.srgb
+        # The resident uint8 RGBA copies: pack passes them through, so in stream mode the
+        # packed targets ARE the dataset's arrays (one host copy, no float temporaries).
+        targets = self._targets.resident
         indices = self._sceneContext.train_indices
         # Streamed fields are derived per step on the GPU, never stored.
         resident_fields = (self._densify_mode == DensificationMode.STRUCTURE_AWARE

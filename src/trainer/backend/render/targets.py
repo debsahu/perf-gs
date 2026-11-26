@@ -97,4 +97,6 @@ class TargetImages:
         return self._structure
 
     def _with_alpha(self, rgb: np.ndarray) -> np.ndarray:
-        return np.concatenate([rgb, np.ones((self.height, self.width, 1), rgb.dtype)], axis=-1)
+        # Opaque is 255 in uint8, 1.0 in float: np.ones would give a uint8 target alpha 1.
+        opaque = 255 if rgb.dtype == np.uint8 else 1
+        return np.concatenate([rgb, np.full((self.height, self.width, 1), opaque, rgb.dtype)], axis=-1)

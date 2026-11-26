@@ -65,7 +65,7 @@ def test_only_training_camera_targets_are_uploaded(tmp_path, monkeypatch):
     args = build_parser().parse_args(["--scene", "unused", "--no-viewer"])
     app = TrainingApplication(args)
     app.scene_context = SimpleNamespace(train_indices=[1, 3], width=8, height=8)
-    app.targets = SimpleNamespace(srgb=[0, 1, 2, 3])
+    app.targets = SimpleNamespace(resident=[0, 1, 2, 3])
     app.config = SimpleNamespace(densify_mode=DensificationMode.SIMPLE)
     uploads = []
     app.pipeline = SimpleNamespace(targets=SimpleNamespace(

@@ -312,6 +312,8 @@ class TrainingApplication:
                    "max_sort_pairs": pipeline.max_sort_pairs,
                    "peak_sort_pairs": peak_pairs, "sort_overflows": overflows,
                    "targets_streamed": self._stream_targets,
+                   **({"target_cache": self._targets.cache_stats()}
+                      if getattr(self._targets, "compressed", False) else {}),
                    "allocated_bytes": owned}
         measured = query_video_memory(self.device.info.adapter_name)
         vram = ""
@@ -340,6 +342,11 @@ class TrainingApplication:
                 "structure_fields_bytes": sum(
                     field.memory_usage.device for field in self.structure_textures.values() if isinstance(field, spy.Texture)),
             }
+        if "target_cache" in summary:
+            c = summary["target_cache"]
+            print(f"[targets] compressed: {c['decodes']} decodes ({c['decode_s'] / max(c['decodes'], 1):.2f} s "
+                  f"each on a worker), {c['hits']} cache hits, training waited {c['wait_s']:.1f} s over "
+                  f"{c['waits']} not-yet-decoded views; peak {c['peak_cached']} views decoded", flush=True)
         print(f"[memory] peak sort pairs {peak_pairs:,} of "
               f"{pipeline.max_sort_pairs:,}; pipeline buffers {owned / GIB:.2f} GiB{vram}")
         if overflows:

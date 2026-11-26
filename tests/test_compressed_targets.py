@@ -54,6 +54,8 @@ def _scene(root: Path, kind: str, size=(W, H), n=6) -> ColmapDataset:
             _write(root / "images" / name, _texture(rng, *size, 4))
         elif kind == "png16":
             _write(root / "images" / name, _texture(rng, *size, 3, np.uint16))
+        elif kind == "rgba16":
+            _write(root / "images" / name, _texture(rng, *size, 4, np.uint16))
         else:
             raise ValueError(kind)
         camera = simple_camera(width=W, height=H, eye=(0.0, 0.0, 0.0), target=(0.0, 0.0, 1.0))
@@ -88,6 +90,8 @@ def _pair(scene, *, use_alpha=False, masks=None, invert=False, **kwargs):
 CASES = [
     ("jpeg", {}), ("png", {}), ("gray", {}), ("png16", {}),
     ("rgba", {"use_alpha": True}), ("rgba", {}),
+    # 16 bits survive the decode only with alpha loading (IMREAD_UNCHANGED); IMREAD_COLOR makes them 8-bit.
+    ("png16", {"use_alpha": True}), ("rgba16", {"use_alpha": True}),
     ("jpeg", {"masks": True}), ("png16", {"masks": True}), ("png", {"masks": True, "invert": True}),
 ]
 
@@ -118,6 +122,15 @@ def test_packed_bytes_match_decoded_mode(tmp_path, kind, opts, disk):
             np.testing.assert_array_equal(decoded.keep_mask(i), compressed.keep_mask(i))
     if masks is not None:
         assert compressed.mask_count == decoded.mask_count == len(scene.images) - 1
+
+
+@pytest.mark.parametrize("kind", ["png16", "rgba16"])
+def test_sixteen_bit_fixture_stays_float(tmp_path, kind):
+    """The 16-bit cases must reach the float residency, or they test nothing a uint8 case does not."""
+    scene = _scene(tmp_path, kind)
+    decoded, compressed = _pair(scene, use_alpha=True)
+    assert decoded.resident[0].dtype == compressed.resident[0].dtype == np.float32
+    assert np.unique(np.rint(decoded.resident[0][..., 0] * 65535) % 257).size > 1   # not an 8-bit image scaled up
 
 
 def test_fixture_discriminates_decoder_and_resize(tmp_path):

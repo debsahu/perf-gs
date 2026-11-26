@@ -460,7 +460,7 @@ class TrainingApplication:
                            and not self._stream_targets)
         bytes_per_pixel = 4 + (8 if resident_fields else 0)
         planned_bytes = len(indices) * self._sceneContext.width * self._sceneContext.height * bytes_per_pixel
-        if self._targets.compressed:
+        if getattr(self._targets, "compressed", False):
             self.target_textures = CompressedTargetViews(self._targets, pipeline.targets.pack, indices)
             print(f"[memory] {len(indices)} training targets compressed in host RAM, decoded "
                   f"{self.args.target_prefetch} steps ahead (decoded would be "

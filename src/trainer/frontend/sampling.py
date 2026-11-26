@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import random
+from collections import deque
 
 import numpy as np
 
@@ -21,6 +22,7 @@ class CameraSampler:
         self.mode = mode
         self._rng = rng
         self._train_arr = np.asarray(train_indices, dtype=np.int64)
+        self._ahead: deque[int] = deque()     # drawn by peek(), not yet returned by next()
         if mode == "sadgs":
             self._py = random.Random(seed)
             train = list(train_indices)
@@ -36,6 +38,18 @@ class CameraSampler:
 
     def next(self) -> int:
         """The train-camera index to optimize this iteration."""
+        if self._ahead:
+            return self._ahead.popleft()
+        return self._draw()
+
+    def peek(self, count: int) -> list[int]:
+        """The next ``count`` indices ``next()`` will return, without consuming them. They are
+        drawn now, in order, from the same stream, so peeking never changes the sequence."""
+        while len(self._ahead) < count:
+            self._ahead.append(self._draw())
+        return list(self._ahead)[:max(0, count)]
+
+    def _draw(self) -> int:
         if self.mode == "sadgs":
             if not self._stack:
                 self._stack.extend(self._base)

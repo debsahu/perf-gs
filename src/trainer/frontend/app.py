@@ -39,7 +39,7 @@ from trainer.frontend.cli import parse_args
 from trainer.frontend.densification import DensificationController, DensifyOutcome
 from trainer.frontend.evaluation import run_report as run_report_module
 from trainer.frontend.evaluation.evaluation import (
-    eval_test_psnr_srgb,
+    eval_test_psnr_srgb_masked,
     render_all_cameras,
     run_eval_sweep,
 )
@@ -73,6 +73,11 @@ from trainer.frontend.viewer.viewer_control import ViewerSession
 
 # t0 for the run report's process_wall_s; trails the true process start by the import cost.
 _PROCESS_STARTED_AT = time.time()
+
+
+def _keep_masks(targets):
+    """The targets' per-camera loss keep masks, or None without --masks."""
+    return getattr(targets, "keep_masks", None)
 
 
 @dataclass(frozen=True)
@@ -171,7 +176,8 @@ class TrainingApplication:
             start = time.perf_counter()
             from trainer.data.lens_calibration import fit_lens_strength
             indices = {scene.colmapScene.images[i].image_name: i for i in scene.train_indices}
-            strength, count = fit_lens_strength(Path(scene_dir), indices, self.targets.srgb)
+            strength, count = fit_lens_strength(Path(scene_dir), indices, self.targets.srgb,
+                                                _keep_masks(self.targets))
             self.args.lens_strength = strength
             self._write_resolved_config()
             print("[auto-lens] " + json.dumps(dict(beta=strength, fit_contrasts=count,
@@ -262,6 +268,7 @@ class TrainingApplication:
                     completed_iters=result.iterations,
                     t_start=result.started_at,
                     psnr_curve=result.psnr_curve,
+                    keep_masks=_keep_masks(self._targets),
                 )
         except RunStopped:
             viewer.state.log("Run stopped; remaining evaluation and exports skipped. "
@@ -343,6 +350,8 @@ class TrainingApplication:
             width=scene.width,
             height=scene.height,
             use_alpha=self.args.w_alpha > 0,
+            masks_dir=getattr(self.args, "masks", None),
+            invert_masks=bool(getattr(self.args, "invert_masks", False)),
         )
         if self.args.write_ground_truths:
             self.targets.write_ground_truths(self.paths.cameras)
@@ -633,13 +642,15 @@ class TrainingApplication:
                 progress=lambda done, total: self._publish_finalize(
                     f"held-out view {done}/{total}", 0.05 + 0.5 * done / max(total, 1)),
                 checkpoint=self._training_runtime.viewer.checkpoint,
+                keep_masks=_keep_masks(self._targets),
             )
             psnr = quality.get("psnr_srgb") or 0.0
+            psnr_lossmask = quality.get("psnr_srgb_lossmask")
             count = self._pipeline.primitives.count()
         else:
-            psnr, count = eval_test_psnr_srgb(
+            psnr, psnr_lossmask, count = eval_test_psnr_srgb_masked(
                 self._pipeline, sceneContext.colmapScene,
-                sceneContext.test_indices, self._targets.srgb,
+                sceneContext.test_indices, self._targets.srgb, _keep_masks(self._targets),
                 checkpoint=self._training_runtime.viewer.checkpoint)
 
         self._training_runtime.viewer.checkpoint()
@@ -659,10 +670,15 @@ class TrainingApplication:
                 "iters": result.iterations,
                 "flat_bucket_backward": bool(self.args.flat_bucket_backward),
                 **self._memory_summary,
+                # Over the --masks kept pixels only (absent without masks).
+                **({"psnr_srgb_lossmask": psnr_lossmask} if _keep_masks(self._targets) is not None else {}),
             }, indent=2))
 
             print(f"[final-test-psnr] TEST PSNR sRGB = {psnr:.3f} dB over "
                   f"{len(sceneContext.test_indices)} held-out cams  (n_gaussians={count})")
+            if psnr_lossmask is not None:
+                print(f"[final-test-psnr] TEST PSNR sRGB over loss-mask kept pixels = "
+                      f"{psnr_lossmask:.3f} dB")
 
         if want_report:
             frames = int(getattr(self.args, "render_fps_frames", 0) or 0)
@@ -908,8 +924,11 @@ class TrainingLoop:
         monitor = self.convergence
         if not monitor.due(step):
             return False
-        score, _ = eval_test_psnr_srgb(self.runtime.pipeline, self.scene.colmapScene, monitor.cameras,
-                                       self.targets.srgb, checkpoint=self.runtime.viewer.checkpoint)
+        unmasked, masked, _ = eval_test_psnr_srgb_masked(
+            self.runtime.pipeline, self.scene.colmapScene, monitor.cameras, self.targets.srgb,
+            _keep_masks(self.targets), checkpoint=self.runtime.viewer.checkpoint)
+        # With --masks the dropped pixels are never trained, so only the kept ones show progress.
+        score = unmasked if masked is None else masked
         plateau = monitor.observe(score)
         self.runtime.artifacts.log_json.write(json.dumps({
             "event": "convergence_probe", "iter": step, "train_psnr_srgb": score,
@@ -1082,11 +1101,12 @@ class TrainingLoop:
         if stream is None or not context.events.psnr_curve:
             return
         started = time.time()
-        psnr, count = eval_test_psnr_srgb(
+        psnr, psnr_lossmask, count = eval_test_psnr_srgb_masked(
             self.runtime.pipeline,
             self.scene.colmapScene,
             self.scene.test_indices,
             self.targets.srgb,
+            _keep_masks(self.targets),
             checkpoint=self.runtime.viewer.checkpoint,
         )
         record = {
@@ -1094,6 +1114,8 @@ class TrainingLoop:
             "psnr_srgb": psnr,
             "n_gaussians": count,
         }
+        if psnr_lossmask is not None:
+            record["psnr_srgb_lossmask"] = psnr_lossmask
         self.psnr_curve_records.append(record)
         stream.write(json.dumps(record) + "\n")
         self.eval_time_total += time.time() - started
@@ -1128,6 +1150,7 @@ class TrainingLoop:
                         (done / total) if total else None,
                         detail=f"camera {done}/{total}"),
                     checkpoint=self.runtime.viewer.checkpoint,
+                    keep_masks=_keep_masks(self.targets),
                 )
             finally:
                 state.end_activity()

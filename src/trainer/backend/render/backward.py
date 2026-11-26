@@ -85,7 +85,10 @@ class RasterBackward:
         variables = contextual.densification_variables
         return variables is None or variables.track_screen_grad or not self.per_splat
 
-    def record(self, contextual: IterationContextualVariables, stbn_kwargs: dict) -> None:
+    def record(self, contextual: IterationContextualVariables, stbn_kwargs: dict,
+               loss_mask: dict | None = None) -> None:
+        """``loss_mask`` is ``{"loss_mask": target}`` under LOSS_MASK: the blend-weight sum
+        then counts kept pixels only (the color gradient is already zero on dropped ones)."""
         variables = contextual.densification_variables
         track_blend_weight = variables is not None and variables.track_blend_weight
         if track_blend_weight and not self.per_splat:
@@ -94,6 +97,7 @@ class RasterBackward:
             "blend_weight_accum": self._tracking.blend_weight.storage,
             "track_blend_weight": int(track_blend_weight),
             "track_screen_grad": int(self.tracks_screen_gradient(contextual)),
+            **(loss_mask or {}),
         }
         # The loss already applied the mask; the compacted backward skips unsampled pixels.
         backward_stbn = stbn_kwargs if self._stbn_compacted else {}

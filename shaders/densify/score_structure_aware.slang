@@ -3,6 +3,7 @@
 #include "../common/types.slang"
 #include "../common/math.slang"
 #include "../primitives/gaussian/project.slang"
+#include "../common/loss_mask.slang"
 
 static const float ETA_HIGH = 1.0;    // eta > this ⟹ under-resolved (split vote)
 static const float ETA_LOW  = 0.1;    // eta < this ⟹ over-resolved (prune vote)
@@ -54,6 +55,31 @@ float3 _sample_structure_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
         }
     }
     return acc;
+}
+
+// Bilinear keep fraction at p from the field's .w (the target's keep mask under LOSS_MASK). Taps
+// outside the image count as kept: there is no mask there, and the unmasked rule then applies.
+float _sample_keep_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
+{
+    float2 pf = floor(p);
+    int2 i0 = int2(pf);
+    float2 f = p - pf;
+    int W = int(dim.x), H = int(dim.y);
+    float keep = 0.0;
+    [unroll]
+    for (int dy = 0; dy < 2; ++dy)
+    {
+        [unroll]
+        for (int dx = 0; dx < 2; ++dx)
+        {
+            int tx = i0.x + dx;
+            int ty = i0.y + dy;
+            float w = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
+            bool inside = tx >= 0 && tx < W && ty >= 0 && ty < H;
+            keep += w * (inside ? tex[int2(tx, ty)].w : 1.0);
+        }
+    }
+    return keep;
 }
 
 // Top eigenvalue of the packed symmetric 2x2 tensor (Sxx, Sxy, Syy).
@@ -143,6 +169,12 @@ void scoreStructureAware(
 
     uint2 dim;
     structure_tensor.GetDimensions(dim.x, dim.y);
+#if LOSS_MASK
+    // A sample landing on dropped pixels is no observation: it neither votes to split nor to
+    // prune, and is not counted in eta_n_total. The field itself is built from the whole target,
+    // so near a mask edge its blur (up to ~10 px) still mixes in dropped content.
+    if (_sample_keep_bilinear(structure_tensor, sample_px, dim) < 0.5) return;
+#endif
     float3 sbar = _sample_structure_bilinear(structure_tensor, sample_px, dim);
 
     float lambda1 = _principal_eigenvalue(sbar);

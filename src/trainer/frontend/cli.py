@@ -131,6 +131,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale-reg", type=float, default=RegularizationConfig.scale_weight)
     parser.add_argument("--w-alpha", type=float, default=LossConfig.alpha_weight,
                     help="alpha loss weight; set > 0 for RGBA targets (e.g. 1.0)")
+    parser.add_argument("--masks", type=str, default=None,
+                    help="folder of per-image loss masks, <DIR>/<image name>.png or <DIR>/<stem>.png "
+                         "(255 = keep). Dropped pixels give no color gradient and do not drive "
+                         "densification or pruning. An image without a mask keeps every pixel. "
+                         "Exclusive with --w-alpha > 0 (the mask is stored in the target's alpha).")
+    parser.add_argument("--invert-masks", action="store_true",
+                    help="the --masks files use 255 = drop (0 = keep)")
     _shared(parser, "lambda_ssim")
     _shared(parser, "max_splats")
     _shared(parser, "final_splat_fraction")

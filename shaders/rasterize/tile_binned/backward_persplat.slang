@@ -10,6 +10,7 @@
 #include "../../primitives/gaussian/blend.slang"
 #include "../../core/compositor.slang"
 #include "../../common/stbn.slang"
+#include "../../common/loss_mask.slang"
 #include "checkpoint.slang"
 
 #include "common/execution.slang"
@@ -127,6 +128,9 @@ groupshared float4 gs_dLdC[TILE_AREA];   // rgb = dL_dC, a = dL_dA
 groupshared float  gs_Tfinal[TILE_AREA];
 groupshared float3 gs_Ctotal[TILE_AREA];
 groupshared uint   gs_processed[TILE_AREA];
+#if LOSS_MASK
+groupshared float  gs_keep[TILE_AREA];   // loss mask of the pixel: 1 keep, 0 drop
+#endif
 groupshared uint   gs_max_processed;     // deepest splat any pixel processed
 
 // Per-warp LDS stage of the bucket's checkpoints for visited pixels only: slot k = (p - phase) / STRIDE.
@@ -178,6 +182,11 @@ void backwardRasterizePerSplat(
     uniform uint track_screen_grad,
     // Visited pixel subset in [0, BACKWARD_PIXEL_STRIDE); the host rotates it per iteration.
     uniform uint pixel_phase,
+#if LOSS_MASK
+    // The active target; .a is the loss keep mask. Only the blend-weight sum reads it: the color
+    // gradient of a dropped pixel is already zero in dL_dC.
+    RWTexture2D<float4> loss_mask,
+#endif
 #if STBN_ENABLED
     // stbn_slice is the image's visit count + phase (not the iteration), walking the mask's temporal axis.
     StructuredBuffer<uint> stbn_table,
@@ -237,6 +246,9 @@ void backwardRasterizePerSplat(
         gs_Tfinal[tid]    = 1.0 - out_px.a;
         gs_Ctotal[tid]    = out_px.rgb / gain;
         gs_processed[tid] = gaussian_count_per_pixel[my_pixel];
+#if LOSS_MASK
+        gs_keep[tid]      = loss_mask[my_pixel].a;
+#endif
     }
     else
     {
@@ -244,6 +256,9 @@ void backwardRasterizePerSplat(
         gs_Tfinal[tid]    = 1.0;
         gs_Ctotal[tid]    = float3(0.0);
         gs_processed[tid] = 0u;   // no splat contributes to an OOB pixel
+#if LOSS_MASK
+        gs_keep[tid]      = 0.0;
+#endif
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -409,7 +424,11 @@ void backwardRasterizePerSplat(
 
                 // shDC is affine, so the color seed is summed here and scaled by SH_C0 after the loop.
                 acc_color += dL_dC * alpha_T;
+#if LOSS_MASK
+                acc_weight += alpha_T * gs_keep[p];   // dropped pixels do not keep a splat alive
+#else
                 acc_weight += alpha_T;
+#endif
 
 #if BACKWARD_BLEND_SCAN_MODE == 0
                 // dot(dL_dC, C_behind) with C_behind = C_total - C_in_front(i) - c_i * alpha_i * T_i.
@@ -527,6 +546,9 @@ void backwardRasterizePerBucket(
     uniform uint track_blend_weight,
     uniform uint track_screen_grad,
     uniform uint pixel_phase,
+#if LOSS_MASK
+    RWTexture2D<float4> loss_mask,
+#endif
 #if STBN_ENABLED
     StructuredBuffer<uint> stbn_table,
     uniform uint2 stbn_dims,
@@ -747,7 +769,11 @@ void backwardRasterizePerBucket(
                 float  T_final = 1.0 - C_total[j].a;
 
                 acc_color += dLdC4[j].rgb * alpha_T;
+#if LOSS_MASK
+                acc_weight += alpha_T * loss_mask[pixel[j]].a;   // dropped pixels do not keep a splat alive
+#else
                 acc_weight += alpha_T;
+#endif
 
 #if BACKWARD_BLEND_SCAN_MODE == 0
                 float dLdC_Cbehind = dot(dLdC4[j].rgb, C_total[j].rgb) - dLdC_C_in_front - dLdC_contrib;

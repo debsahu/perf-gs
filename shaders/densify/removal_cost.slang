@@ -2,6 +2,7 @@
 
 #include "primitives/gaussian/blend.slang"
 #include "rasterize/tile_binned/blend_forward.slang"
+#include "common/loss_mask.slang"
 
 // Replay one pixel per 4x4 block up to the actual forward pass's early stop.
 [shader("compute")]
@@ -10,11 +11,17 @@ void accumulateRemovalCost(uint3 tid : SV_DispatchThreadID,
     StructuredBuffer<CameraData> camera, StructuredBuffer<BlendData> blend_data,
     StructuredBuffer<uint> tile_start, StructuredBuffer<uint> sorted_ids,
     RWTexture2D<uint> processed, RWTexture2D<float4> image, RWStructuredBuffer<I64Atomic> scores,
+#if LOSS_MASK
+    RWTexture2D<float4> loss_mask,   // the active target; .a is the keep mask
+#endif
     uniform uint phase, uniform float hardness)
 {
     uint2 pixel = tid.xy * 4u + uint2(phase & 3u, phase >> 2u);
     uint2 dims = uint2(camera[0].image_size);
     if (any(pixel >= dims)) return;
+#if LOSS_MASK
+    if (loss_mask[pixel].a < 0.5) return;   // a dropped pixel cannot vouch for a splat
+#endif
     uint tile = pixel.x / TILE_WIDTH + (pixel.y / TILE_HEIGHT) * ((dims.x + TILE_WIDTH - 1u) / TILE_WIDTH);
     uint offset = tile_start[tile], stop = processed[pixel];
     Compositor comp;

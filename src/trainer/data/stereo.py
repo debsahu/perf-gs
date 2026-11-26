@@ -8,7 +8,7 @@ from functools import cache
 import cv2
 import numpy as np
 
-from trainer.data.colmap import ColmapDataset, _srgb_colors_to_sh0, load_colmap_image
+from trainer.data.colmap import ColmapDataset, _srgb_colors_to_sh0, load_colmap_image, load_colmap_mask
 from trainer.data.parallel import map_ordered
 
 DEFAULT_SEED_LIMIT = 256_000
@@ -37,8 +37,11 @@ def _matched_pixels(left, right):
     return x[keep], y[keep], disparity[keep]
 
 
-def seed_from_stereo(dataset: ColmapDataset, train_indices: Sequence[int], limit: int = DEFAULT_SEED_LIMIT) -> int:
-    """Append up to `limit` seeds supported by three training views. Return the number added."""
+def seed_from_stereo(dataset: ColmapDataset, train_indices: Sequence[int], limit: int = DEFAULT_SEED_LIMIT,
+                     masks_dir=None, invert_masks: bool = False) -> int:
+    """Append up to `limit` seeds supported by three training views. Return the number added.
+    With loss masks (``masks_dir``), a seed whose projection lands on a dropped pixel of any of
+    its three views is discarded: no masked content is seeded."""
     entries = [dataset.images[i] for i in train_indices]
     points = dataset.initial_points
     if len(entries) < 3 or not len(points["means"]) or limit <= 0:
@@ -53,6 +56,26 @@ def seed_from_stereo(dataset: ColmapDataset, train_indices: Sequence[int], limit
     @cache
     def image(index):
         return np.rint(load_colmap_image(entries[index], dataset.image_dir, *size) * 255).astype(np.uint8)
+
+    @cache
+    def keep(index):
+        if masks_dir is None:
+            return None
+        mask = load_colmap_mask(entries[index], masks_dir, *size, invert_masks)
+        return None if mask is None else mask > 0
+
+    def kept(index, world):
+        mask = keep(index)
+        if mask is None:
+            return np.ones(len(world), bool)
+        local = (world - centers[index]) @ rotations[index].T
+        k = intrinsics[index]
+        uv = np.rint(local[:, :2] / np.maximum(local[:, 2:], 1e-6) * [k[0, 0], k[1, 1]] + k[:2, 2])
+        inside = (local[:, 2] > 0) & (uv >= 0).all(axis=1) & (uv < size).all(axis=1)
+        ok = np.ones(len(world), bool)   # outside the view: no mask there
+        ui, vi = uv[inside].astype(int).T
+        ok[inside] = mask[vi, ui]
+        return ok
 
     def rectify(index, rotation, projection, axis):
         maps = cv2.initUndistortRectifyMap(intrinsics[index], None, rotation, projection, size, cv2.CV_32FC1)
@@ -90,6 +113,8 @@ def seed_from_stereo(dataset: ColmapDataset, train_indices: Sequence[int], limit
         tx, ty = uv[seen].astype(int).T
         rgb = left[v, u]
         seen[seen] = np.mean(abs(image(check)[ty, tx].astype(np.float32) - rgb[seen]), axis=1) < 18
+        if masks_dir is not None:
+            seen &= kept(a, world) & kept(b, world) & kept(check, world)
         return world[seen], rgb[seen], z[seen] * 1.5 / pa[0, 0]
 
     anchors = np.linspace(0, len(entries) - 1, min(28, len(entries)), dtype=int)

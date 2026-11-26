@@ -56,6 +56,9 @@ EXPECTED_DEFAULTS = {
     "prune_blend_weight": 0.2,
     "prune_blend_from": 900,
     "reset_every": 1200,
+    # Per-image loss masks (off) and their polarity (255 = keep unless inverted).
+    "masks": None,
+    "invert_masks": False,
     "opacity_reg": 0.0,
     "scale_reg": 0.0,
     "w_alpha": 0.0,

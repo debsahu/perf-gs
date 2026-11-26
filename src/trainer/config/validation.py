@@ -47,6 +47,13 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
     """
     mode = DensificationMode(args.densify_mode)
 
+    masks = getattr(args, "masks", None)
+    if masks and float(getattr(args, "w_alpha", 0.0)) > 0.0:
+        raise ConfigError("--masks and --w-alpha > 0 are exclusive: the loss mask is stored in the "
+                          "target's alpha channel, so alpha supervision would train against the mask.")
+    if getattr(args, "invert_masks", False) and not masks:
+        raise ConfigError("--invert-masks needs --masks.")
+
     if args.iters < 1 and not (args.preset == "quality+" and args.iters == 0):
         raise ConfigError(f"--iters must be >= 1, got {args.iters}.")
     if args.max_splats < 1:

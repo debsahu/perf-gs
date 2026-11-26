@@ -114,7 +114,7 @@ class StructureTensor:
                            intTensor=self._integrated, accum=self._accum, dim=self._dim,
                            gamma=float(self.gamma), freq_sq=float(freq_sq))
             current, sigma_accum = following, target_sigma
-        self._dispatch(encoder, "finalize", accum=self._accum, fieldOut=dst,
+        self._dispatch(encoder, "finalize", accum=self._accum, source=src, fieldOut=dst,
                        dim=self._dim, min_energy=float(MIN_ENERGY))
 
     def compute(self, image_srgb: np.ndarray) -> np.ndarray:

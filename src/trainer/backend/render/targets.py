@@ -39,10 +39,9 @@ class TargetImages:
         self._structure: spy.Texture | None = None
 
     def set_image(self, rgb: np.ndarray) -> None:
-        """Upload ``(H, W, 3)`` sRGB into the owned target and make it active."""
-        assert rgb.shape == (self.height, self.width, 3), (
-            f"target shape {rgb.shape} != ({self.height}, {self.width}, 3)")
-        self._owned.copy_from_numpy(srgb01_to_u8(self._with_alpha(rgb)))
+        """Upload ``(H, W, 3)`` sRGB (or ``(H, W, 4)`` with alpha / loss mask) into the owned
+        target and make it active."""
+        self._owned.copy_from_numpy(self.pack(rgb))
         self.active = self._owned
 
     def pack(self, image: np.ndarray) -> np.ndarray:

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Debashish Sahu. BSD 3-Clause License, as the rest of this repository (see LICENSE).
+
 """Per-image loss masks (--masks / --invert-masks).
 
 The mask rides in the target's alpha (255 = keep). With LOSS_MASK compiled in, a dropped pixel gives
@@ -198,6 +200,62 @@ def test_auto_lens_skips_landmarks_on_dropped_pixels():
     keep[:, : w // 2] = False
     assert list(_sample_tracks(features, intrinsics, image)[0]) == [0, 1, 2, 3]
     assert list(_sample_tracks(features, intrinsics, image, keep)[0]) == [2, 3]
+
+
+def test_auto_lens_needs_every_neighbourhood_tap_on_kept_pixels():
+    """A landmark whose sampling neighbourhood is only PARTLY kept is dropped, not just a mostly-dropped one."""
+    from trainer.data.lens_calibration import _sample_tracks
+    h, w = 160, 240
+    image = np.full((h, w, 3), 0.5, np.float32)
+    # pixel = x - 0.5, taps at pixel +-1 (radius 1 at this width). Landmark 0 sits at pixel 120.6: its left taps
+    # (119.6) read 0.6 kept (columns < 120 are dropped), its centre and right taps are fully kept.
+    features = {"xy": np.array([[121.1, 80.0], [200.0, 80.0]]), "id": np.arange(2)}
+    intrinsics = {"width": w, "height": h, "cx": w / 2, "cy": h / 2, "fx": 200.0, "fy": 200.0}
+    keep = np.ones((h, w), bool)
+    keep[:, :120] = False
+    assert list(_sample_tracks(features, intrinsics, image)[0]) == [0, 1]
+    assert list(_sample_tracks(features, intrinsics, image, keep)[0]) == [1]
+
+
+@pytest.mark.parametrize(("masked", "expected"), [(30.0, 30.0), (None, 10.0)], ids=["masks", "no-masks"])
+def test_convergence_probe_scores_kept_pixels_with_masks(monkeypatch, masked, expected):
+    from types import SimpleNamespace
+    from trainer.frontend import app
+    observed = []
+    monitor = SimpleNamespace(due=lambda step: True, cameras=[0, 1], stale_checks=0,
+                              observe=lambda score: observed.append(score) or False)
+    monkeypatch.setattr(app, "eval_test_psnr_srgb_masked", lambda *a, **k: (10.0, masked, 5))
+    fake = SimpleNamespace(
+        convergence=monitor, scene=SimpleNamespace(colmapScene=None),
+        targets=SimpleNamespace(srgb=[], keep_masks=None if masked is None else []),
+        runtime=SimpleNamespace(pipeline=None, viewer=SimpleNamespace(checkpoint=lambda: None),
+                                artifacts=SimpleNamespace(log_json=SimpleNamespace(write=lambda text: None))))
+    app.TrainingLoop._check_convergence(fake, 100)
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize(("masks", "compiled", "raises"),
+                         [("m", False, True), ("m", True, False), (None, False, False)],
+                         ids=["masks-without-define", "masks-with-define", "no-masks"])
+def test_masks_refuse_a_pipeline_without_loss_mask(monkeypatch, masks, compiled, raises):
+    from types import SimpleNamespace
+    from trainer.frontend import app
+    calls = []
+    pipeline = SimpleNamespace(loss_mask=compiled, rasterizer=SimpleNamespace(),
+                               mip_filter=SimpleNamespace(set_cameras=lambda cams: calls.append(cams)))
+    monkeypatch.setattr(app, "create_pipeline", lambda **kwargs: pipeline)
+    fake = SimpleNamespace(
+        args=SimpleNamespace(masks=masks, max_sort_pairs=None, lens_strength=None, natural_vignetting=False),
+        slang_session=lambda: None, _plan_memory=lambda scene, session: 16, device=None, gpu_lock=None,
+        _config=None, _pipeline=pipeline)
+    scene = SimpleNamespace(colmapScene=SimpleNamespace(initial_points={}, images=[]), train_indices=[])
+    if raises:
+        with pytest.raises(RuntimeError, match="compiled without LOSS_MASK"):
+            app.TrainingApplication._create_pipeline_for_scene(fake, scene)
+        assert calls == []
+    else:
+        app.TrainingApplication._create_pipeline_for_scene(fake, scene)
+        assert calls == [[]]
 
 
 def test_stereo_seeds_skip_dropped_pixels(plane_scene, tmp_path):

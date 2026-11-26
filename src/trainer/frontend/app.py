@@ -75,6 +75,13 @@ from trainer.frontend.viewer.viewer_control import ViewerSession
 _PROCESS_STARTED_AT = time.time()
 
 
+def require_loss_mask(args, pipeline) -> None:
+    """--masks needs the LOSS_MASK shaders; without them the masks would be silently ignored."""
+    if getattr(args, "masks", None) and not getattr(pipeline, "loss_mask", False):
+        raise RuntimeError("--masks is set but the training pipeline was compiled without LOSS_MASK, "
+                           "so the masks would be ignored")
+
+
 def _keep_masks(targets):
     """The targets' per-camera loss keep masks, or None without --masks."""
     return getattr(targets, "keep_masks", None)
@@ -380,6 +387,7 @@ class TrainingApplication:
             initial_state=scene.colmapScene.initial_points,
             slang_session=session,
         )
+        require_loss_mask(self.args, self.pipeline)
         strength = getattr(self.args, "lens_strength", None)
         self._pipeline.rasterizer.natural_vignetting = self.args.natural_vignetting if strength is None else strength
         self._pipeline.mip_filter.set_cameras(

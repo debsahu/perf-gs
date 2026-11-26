@@ -22,8 +22,8 @@ def psnr(rendered: np.ndarray, target: np.ndarray) -> float:
 
 
 def psnr_masked(rendered: np.ndarray, target: np.ndarray, keep: np.ndarray | None) -> float | None:
-    """PSNR over the pixels a loss mask keeps (``keep``: boolean HxW), as Brush reports it:
-    the MSE is averaged over kept pixels only. None without a mask or with no kept pixel."""
+    """PSNR over the pixels a loss mask keeps (``keep``: boolean HxW): the MSE is averaged over
+    kept pixels only. None without a mask or with no kept pixel."""
     if keep is None or not keep.any():
         return None
     return psnr(rendered[keep], target[keep])

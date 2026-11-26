@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Electronic Arts Inc. All rights reserved.
+// Copyright (c) 2026 Debashish Sahu. BSD 3-Clause License, as the rest of this repository (see LICENSE).
 
 #ifndef TRAINER_LOSS_MASK_SLANG
 #define TRAINER_LOSS_MASK_SLANG

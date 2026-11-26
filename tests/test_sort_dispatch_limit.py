@@ -1,5 +1,7 @@
-# compute/perfgs sort_dispatch_limit.patch: --max-sort-pairs is bounded by the DEVICE's dispatch limit, not by the
-# Vulkan-spec minimum of 65,535 groups. Runs in perf-gs's own harness (fixtures from conftest.py).
+# Copyright (c) 2026 Debashish Sahu. BSD 3-Clause License, as the rest of this repository (see LICENSE).
+
+# --max-sort-pairs is bounded by the DEVICE's dispatch limit, not by the Vulkan-spec minimum of 65,535 groups.
+# Fixtures come from conftest.py.
 from __future__ import annotations
 
 import os

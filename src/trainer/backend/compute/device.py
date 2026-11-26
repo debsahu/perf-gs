@@ -21,6 +21,7 @@ if not SHADERS_DIR.is_dir():
 _BACKEND_MAP: dict[Backend, spy.DeviceType] = {
     "vulkan": spy.DeviceType.vulkan,
     "d3d12": spy.DeviceType.d3d12,
+    "metal": spy.DeviceType.metal,
 }
 
 

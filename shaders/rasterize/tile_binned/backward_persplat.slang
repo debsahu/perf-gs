@@ -159,20 +159,20 @@ void backwardRasterizePerSplat(
     RWTexture2D<uint> gaussian_count_per_pixel,
     RWTexture2D<float4> dL_dC_texture,
     // Tile-summed BlendData seeds for projection_backward.slang; the color grads below are final.
-    RWStructuredBuffer<int64_t> grad_mean2d_x,
-    RWStructuredBuffer<int64_t> grad_mean2d_y,
-    RWStructuredBuffer<int64_t> grad_conic_a,
-    RWStructuredBuffer<int64_t> grad_conic_b,
-    RWStructuredBuffer<int64_t> grad_conic_c,
-    RWStructuredBuffer<int64_t> grad_amplitude,
-    RWStructuredBuffer<int64_t> grad_opacity,   // opaque_core's direct falloff term only
-    RWStructuredBuffer<int64_t> grad_color_r,
-    RWStructuredBuffer<int64_t> grad_color_g,
-    RWStructuredBuffer<int64_t> grad_color_b,
-    RWStructuredBuffer<int64_t> grad_2d_x_iter,
-    RWStructuredBuffer<int64_t> grad_2d_y_iter,
+    RWStructuredBuffer<I64Atomic> grad_mean2d_x,
+    RWStructuredBuffer<I64Atomic> grad_mean2d_y,
+    RWStructuredBuffer<I64Atomic> grad_conic_a,
+    RWStructuredBuffer<I64Atomic> grad_conic_b,
+    RWStructuredBuffer<I64Atomic> grad_conic_c,
+    RWStructuredBuffer<I64Atomic> grad_amplitude,
+    RWStructuredBuffer<I64Atomic> grad_opacity,   // opaque_core's direct falloff term only
+    RWStructuredBuffer<I64Atomic> grad_color_r,
+    RWStructuredBuffer<I64Atomic> grad_color_g,
+    RWStructuredBuffer<I64Atomic> grad_color_b,
+    RWStructuredBuffer<I64Atomic> grad_2d_x_iter,
+    RWStructuredBuffer<I64Atomic> grad_2d_y_iter,
     // Densify-window sum of each splat's blend weight alpha * T; written only when track_blend_weight != 0.
-    RWStructuredBuffer<int64_t> blend_weight_accum,
+    RWStructuredBuffer<I64Atomic> blend_weight_accum,
     uniform uint track_blend_weight,
     // Screen-gradient tracking for densification (grad_2d_*_iter); off once densification ends.
     uniform uint track_screen_grad,
@@ -465,26 +465,26 @@ void backwardRasterizePerSplat(
             {
                 // STBN visited visit_count of the tile's pixels; scale to all.
                 float coverage = float(TILE_AREA) / float(max(visit_count, 1u));
-                InterlockedAdd(blend_weight_accum[g_idx], toFixed(acc_weight * coverage));
+                atomicAdd64(blend_weight_accum, g_idx, toFixed(acc_weight * coverage));
             }
 
             // projection_backward.slang applies J^T once per gaussian to these tile sums.
-            InterlockedAdd(grad_mean2d_x[g_idx], toFixed(acc_mean2d.x));
-            InterlockedAdd(grad_mean2d_y[g_idx], toFixed(acc_mean2d.y));
-            InterlockedAdd(grad_conic_a[g_idx], toFixed(acc_conic.x));
-            InterlockedAdd(grad_conic_b[g_idx], toFixed(acc_conic.y));
-            InterlockedAdd(grad_conic_c[g_idx], toFixed(acc_conic.z));
-            InterlockedAdd(grad_amplitude[g_idx], toFixed(acc_amplitude));
+            atomicAdd64(grad_mean2d_x, g_idx, toFixed(acc_mean2d.x));
+            atomicAdd64(grad_mean2d_y, g_idx, toFixed(acc_mean2d.y));
+            atomicAdd64(grad_conic_a, g_idx, toFixed(acc_conic.x));
+            atomicAdd64(grad_conic_b, g_idx, toFixed(acc_conic.y));
+            atomicAdd64(grad_conic_c, g_idx, toFixed(acc_conic.z));
+            atomicAdd64(grad_amplitude, g_idx, toFixed(acc_amplitude));
 #if SPLAT_KERNEL == 3
-            InterlockedAdd(grad_opacity[g_idx], toFixed(acc_opacity));
+            atomicAdd64(grad_opacity, g_idx, toFixed(acc_opacity));
 #endif
-            InterlockedAdd(grad_color_r[g_idx], toFixed(acc_color.x));
-            InterlockedAdd(grad_color_g[g_idx], toFixed(acc_color.y));
-            InterlockedAdd(grad_color_b[g_idx], toFixed(acc_color.z));
+            atomicAdd64(grad_color_r, g_idx, toFixed(acc_color.x));
+            atomicAdd64(grad_color_g, g_idx, toFixed(acc_color.y));
+            atomicAdd64(grad_color_b, g_idx, toFixed(acc_color.z));
             if (track_screen_grad != 0u)
             {
-                InterlockedAdd(grad_2d_x_iter[g_idx], toFixed(acc_absx));
-                InterlockedAdd(grad_2d_y_iter[g_idx], toFixed(acc_absy));
+                atomicAdd64(grad_2d_x_iter, g_idx, toFixed(acc_absx));
+                atomicAdd64(grad_2d_y_iter, g_idx, toFixed(acc_absy));
             }
         }
 
@@ -511,19 +511,19 @@ void backwardRasterizePerBucket(
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
     RWTexture2D<float4> dL_dC_texture,
-    RWStructuredBuffer<int64_t> grad_mean2d_x,
-    RWStructuredBuffer<int64_t> grad_mean2d_y,
-    RWStructuredBuffer<int64_t> grad_conic_a,
-    RWStructuredBuffer<int64_t> grad_conic_b,
-    RWStructuredBuffer<int64_t> grad_conic_c,
-    RWStructuredBuffer<int64_t> grad_amplitude,
-    RWStructuredBuffer<int64_t> grad_opacity,
-    RWStructuredBuffer<int64_t> grad_color_r,
-    RWStructuredBuffer<int64_t> grad_color_g,
-    RWStructuredBuffer<int64_t> grad_color_b,
-    RWStructuredBuffer<int64_t> grad_2d_x_iter,
-    RWStructuredBuffer<int64_t> grad_2d_y_iter,
-    RWStructuredBuffer<int64_t> blend_weight_accum,
+    RWStructuredBuffer<I64Atomic> grad_mean2d_x,
+    RWStructuredBuffer<I64Atomic> grad_mean2d_y,
+    RWStructuredBuffer<I64Atomic> grad_conic_a,
+    RWStructuredBuffer<I64Atomic> grad_conic_b,
+    RWStructuredBuffer<I64Atomic> grad_conic_c,
+    RWStructuredBuffer<I64Atomic> grad_amplitude,
+    RWStructuredBuffer<I64Atomic> grad_opacity,
+    RWStructuredBuffer<I64Atomic> grad_color_r,
+    RWStructuredBuffer<I64Atomic> grad_color_g,
+    RWStructuredBuffer<I64Atomic> grad_color_b,
+    RWStructuredBuffer<I64Atomic> grad_2d_x_iter,
+    RWStructuredBuffer<I64Atomic> grad_2d_y_iter,
+    RWStructuredBuffer<I64Atomic> blend_weight_accum,
     uniform uint track_blend_weight,
     uniform uint track_screen_grad,
     uniform uint pixel_phase,
@@ -797,24 +797,24 @@ void backwardRasterizePerBucket(
         if (track_blend_weight != 0u)
         {
             float coverage = float(TILE_AREA) / float(max(visit_count, 1u));
-            InterlockedAdd(blend_weight_accum[g_idx], toFixed(acc_weight * coverage));
+            atomicAdd64(blend_weight_accum, g_idx, toFixed(acc_weight * coverage));
         }
-        InterlockedAdd(grad_mean2d_x[g_idx], toFixed(acc_mean2d.x));
-        InterlockedAdd(grad_mean2d_y[g_idx], toFixed(acc_mean2d.y));
-        InterlockedAdd(grad_conic_a[g_idx], toFixed(acc_conic.x));
-        InterlockedAdd(grad_conic_b[g_idx], toFixed(acc_conic.y));
-        InterlockedAdd(grad_conic_c[g_idx], toFixed(acc_conic.z));
-        InterlockedAdd(grad_amplitude[g_idx], toFixed(acc_amplitude));
+        atomicAdd64(grad_mean2d_x, g_idx, toFixed(acc_mean2d.x));
+        atomicAdd64(grad_mean2d_y, g_idx, toFixed(acc_mean2d.y));
+        atomicAdd64(grad_conic_a, g_idx, toFixed(acc_conic.x));
+        atomicAdd64(grad_conic_b, g_idx, toFixed(acc_conic.y));
+        atomicAdd64(grad_conic_c, g_idx, toFixed(acc_conic.z));
+        atomicAdd64(grad_amplitude, g_idx, toFixed(acc_amplitude));
 #if SPLAT_KERNEL == 3
-        InterlockedAdd(grad_opacity[g_idx], toFixed(acc_opacity));
+        atomicAdd64(grad_opacity, g_idx, toFixed(acc_opacity));
 #endif
-        InterlockedAdd(grad_color_r[g_idx], toFixed(acc_color.x));
-        InterlockedAdd(grad_color_g[g_idx], toFixed(acc_color.y));
-        InterlockedAdd(grad_color_b[g_idx], toFixed(acc_color.z));
+        atomicAdd64(grad_color_r, g_idx, toFixed(acc_color.x));
+        atomicAdd64(grad_color_g, g_idx, toFixed(acc_color.y));
+        atomicAdd64(grad_color_b, g_idx, toFixed(acc_color.z));
         if (track_screen_grad != 0u)
         {
-            InterlockedAdd(grad_2d_x_iter[g_idx], toFixed(acc_absx));
-            InterlockedAdd(grad_2d_y_iter[g_idx], toFixed(acc_absy));
+            atomicAdd64(grad_2d_x_iter, g_idx, toFixed(acc_absx));
+            atomicAdd64(grad_2d_y_iter, g_idx, toFixed(acc_absy));
         }
     }
 }

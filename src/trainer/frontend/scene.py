@@ -79,9 +79,10 @@ def load_scene_context(args: argparse.Namespace, prepared: ColmapDataset | None 
         from trainer.data.stereo import DEFAULT_SEED_LIMIT, seed_from_stereo
         limit = min(DEFAULT_SEED_LIMIT, args.max_splats - initial_count)
         masks = getattr(args, "masks", None)
-        initial_count += seed_from_stereo(colmap_scene, train_indices, limit=limit,
-                                          masks_dir=Path(masks) if masks else None,
-                                          invert_masks=bool(getattr(args, "invert_masks", False)))
+        # Loss masks drop seeds on masked pixels; without them the call is unchanged.
+        mask_kwargs = ({"masks_dir": Path(masks), "invert_masks": bool(getattr(args, "invert_masks", False))}
+                       if masks else {})
+        initial_count += seed_from_stereo(colmap_scene, train_indices, limit=limit, **mask_kwargs)
     if args.eval_holdout:
         print(f"[eval] holdout protocol ON (stride={stride}): "
               f"{len(train_indices)} train / {len(test_indices)} test cameras. "

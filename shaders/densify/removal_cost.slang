@@ -8,12 +8,12 @@
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void accumulateRemovalCost(uint3 tid : SV_DispatchThreadID,
-    StructuredBuffer<CameraData> camera, StructuredBuffer<BlendData> blend_data,
-    StructuredBuffer<uint> tile_start, StructuredBuffer<uint> sorted_ids,
-    RWTexture2D<uint> processed, RWTexture2D<float4> image, RWStructuredBuffer<I64Atomic> scores,
 #if LOSS_MASK
     RWTexture2D<float4> loss_mask,   // the active target; .a is the keep mask
 #endif
+    StructuredBuffer<CameraData> camera, StructuredBuffer<BlendData> blend_data,
+    StructuredBuffer<uint> tile_start, StructuredBuffer<uint> sorted_ids,
+    RWTexture2D<uint> processed, RWTexture2D<float4> image, RWStructuredBuffer<I64Atomic> scores,
     uniform uint phase, uniform float hardness)
 {
     uint2 pixel = tid.xy * 4u + uint2(phase & 3u, phase >> 2u);

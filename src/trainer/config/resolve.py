@@ -11,6 +11,7 @@ from trainer.config.config import (
     AdamLRs,
     AppearanceConfig,
     DensifyConfig,
+    GeometryConfig,
     LossConfig,
     RasterConfig,
     RegularizationConfig,
@@ -45,6 +46,27 @@ def shader_specialization(args: argparse.Namespace) -> ShaderSpecialization:
         splat_profile_power=float(args.splat_profile_power),
         splat_profile_onset=float(args.splat_profile_onset),
         loss_mask=bool(getattr(args, "masks", None)),
+        geom_priors=geometry_config(args).image_terms,
+    )
+
+
+def geometry_config(args: argparse.Namespace) -> GeometryConfig:
+    """The depth / normal / depth-normal / flatten settings; every flag defaults to off."""
+    g = getattr
+    return GeometryConfig(
+        depth_weight=float(g(args, "depth_loss_weight", 0.0) or 0.0),
+        normal_weight=float(g(args, "normal_loss_weight", 0.0) or 0.0),
+        depth_normal_weight=float(g(args, "depth_normal_weight", 0.0) or 0.0),
+        flatten_weight=float(g(args, "flatten_loss_weight", 0.0) or 0.0),
+        depth_source=str(g(args, "depth_source", "center")),
+        depth_space=str(g(args, "depth_loss_space", "disparity")),
+        normal_loss=str(g(args, "normal_loss", "l1")),
+        normal_encoding=str(g(args, "normal_encoding", "slam")),
+        min_alpha=float(g(args, "geom_min_alpha", 0.5)),
+        start_iter=int(g(args, "geom_from", 0)),
+        units_per_meter=float(g(args, "geom_units_per_meter", 1.0)),
+        depth_dir=g(args, "depth_dir", None),
+        normal_dir=g(args, "normal_dir", None),
     )
 
 
@@ -65,6 +87,7 @@ class RunConfig:
     position_lr_max_steps: int
     # Scale and rotation LR multipliers at the first and the last step.
     scale_rotation_lr_decay: tuple[float, float]
+    geometry: GeometryConfig = GeometryConfig()
 
     @classmethod
     def from_args(cls, args: argparse.Namespace, scene_extent: float) -> RunConfig:
@@ -114,6 +137,7 @@ class RunConfig:
             position_lr_max_steps=(schedule.optimization_steps if args.position_lr_max_steps <= 0
                                    else args.position_lr_max_steps),
             scale_rotation_lr_decay=scale_rotation_lr_decay,
+            geometry=geometry_config(args),
         )
 
 

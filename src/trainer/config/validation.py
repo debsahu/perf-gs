@@ -53,6 +53,7 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
                           "target's alpha channel, so alpha supervision would train against the mask.")
     if getattr(args, "invert_masks", False) and not masks:
         raise ConfigError("--invert-masks needs --masks.")
+    validate_geometry(args)
 
     if args.iters < 1 and not (args.preset == "quality+" and args.iters == 0):
         raise ConfigError(f"--iters must be >= 1, got {args.iters}.")
@@ -126,3 +127,33 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
         raise ConfigError(
             f"--eval is on but the holdout split left 0 test views "
             f"({n_cams} cameras, stride {stride}).")
+
+
+def validate_geometry(args: argparse.Namespace) -> None:
+    """The depth / normal / depth-normal / flatten flags: refuse what would crash or do nothing."""
+    g = getattr
+    weights = {"--depth-loss-weight": float(g(args, "depth_loss_weight", 0.0) or 0.0),
+               "--normal-loss-weight": float(g(args, "normal_loss_weight", 0.0) or 0.0),
+               "--depth-normal-weight": float(g(args, "depth_normal_weight", 0.0) or 0.0),
+               "--flatten-loss-weight": float(g(args, "flatten_loss_weight", 0.0) or 0.0)}
+    for flag, value in weights.items():
+        if not value >= 0.0:
+            raise ConfigError(f"{flag} must be >= 0, got {value}.")
+    for weight, folder, flag in (("--depth-loss-weight", "depth_dir", "--depth-dir"),
+                                 ("--normal-loss-weight", "normal_dir", "--normal-dir")):
+        has_dir = bool(g(args, folder, None))
+        if weights[weight] > 0.0 and not has_dir:
+            raise ConfigError(f"{weight} > 0 needs {flag}.")
+        if has_dir and weights[weight] <= 0.0:
+            raise ConfigError(f"{flag} is set but {weight} is 0: the priors would be decoded for nothing.")
+    image_terms = max(weights["--depth-loss-weight"], weights["--normal-loss-weight"],
+                      weights["--depth-normal-weight"]) > 0.0
+    if image_terms and float(g(args, "stbn_pixel_fraction", 1.0)) < 1.0:
+        raise ConfigError("depth/normal losses are not supported with STBN (--stbn-pixel-fraction < 1): "
+                          "their gradient needs every pixel's neighbours.")
+    if not 0.0 < float(g(args, "geom_units_per_meter", 1.0)):
+        raise ConfigError("--geom-units-per-meter must be > 0.")
+    if not 0.0 < float(g(args, "geom_min_alpha", 0.5)) <= 1.0:
+        raise ConfigError("--geom-min-alpha must be in (0, 1].")
+    if int(g(args, "geom_from", 0)) < 0:
+        raise ConfigError("--geom-from must be >= 0.")

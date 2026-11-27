@@ -31,6 +31,11 @@ void forwardRasterize(
     RWStructuredBuffer<uint2> raster_checkpoints,
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
+#if GEOM_PRIORS
+    // Per-splat (n, s) from geom_features.slang, and their composite (N, S) per pixel.
+    StructuredBuffer<float4> geom_data,
+    RWTexture2D<float4> aux_image,
+#endif
     uniform float extinction_hardness)
 {
     uint2 frame_dim_px = uint2(camera[0].image_size);
@@ -65,10 +70,18 @@ void forwardRasterize(
     float3 C[PIXELS_PER_THREAD];
     float T[PIXELS_PER_THREAD];
     uint processed[PIXELS_PER_THREAD];
+#if GEOM_PRIORS
+    float4 aux[PIXELS_PER_THREAD];
+    blendForwardAux<GaussianSource, PIXELS_PER_THREAD>(
+        src, t_start, tile_count, pixel_center, valid_pixel,
+        pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
+        raster_checkpoints, extinction_hardness, geom_data, C, T, processed, aux);
+#else
     blendForward<GaussianSource, PIXELS_PER_THREAD>(
         src, t_start, tile_count, pixel_center, valid_pixel,
         pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
         raster_checkpoints, extinction_hardness, C, T, processed);
+#endif
 
     [unroll]
     for (uint j = 0u; j < PIXELS_PER_THREAD; ++j)
@@ -78,5 +91,8 @@ void forwardRasterize(
         // The backward recovers final transmittance as T = 1 - output_image.a.
         output_image[pixel[j]] = float4(C[j] * camera[0].lensGain(pixel[j]), 1.0 - T[j]);
         gaussian_count_per_pixel[pixel[j]] = processed[j];
+#if GEOM_PRIORS
+        aux_image[pixel[j]] = aux[j];   // no lens gain: geometry is not color
+#endif
     }
 }

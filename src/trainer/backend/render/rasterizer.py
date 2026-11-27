@@ -53,8 +53,10 @@ class Rasterizer:
                  raster: RasterResources, sh: SphericalHarmonicsResources | None,
                  scan: PrefixScan, sort: RadixSort, config: RasterConfig,
                  width: int, height: int, num_tiles_x: int, num_tiles_y: int,
-                 capacity: int) -> None:
+                 capacity: int, geometry=None) -> None:
         self._commands = commands
+        # GeometryForward under GEOM_PRIORS (backend/render/geometry.py), else None.
+        self.geometry = geometry
         self._k = kernels.load({**self.KERNELS,
                                 **(self.SH_KERNELS if sh is not None else {}),
                                 **(self.CULL_KERNELS if config.cluster_cull else {})})
@@ -150,6 +152,13 @@ class Rasterizer:
                 z_near=config.z_near_cull,
                 max_splats=capacity)
 
+        if self.geometry is not None:
+            with commands.marker_group("geom_features"):
+                self.geometry.record(commands, gaussians=primitive.values.storage,
+                                     active_count=primitive.active_count.storage,
+                                     camera=self.camera_buffer,
+                                     cluster_visible=r.cluster_visible.storage)
+
         if self._sh is not None:
             with commands.marker_group("sh_forward"):
                 commands.dispatch(k.sh_forward, "sh_forward",
@@ -234,4 +243,5 @@ class Rasterizer:
                 raster_checkpoints=r.raster_checkpoints.storage,
                 output_image=r.output_image,
                 gaussian_count_per_pixel=r.gaussian_count_per_pixel,
+                **(self.geometry.forward_kwargs() if self.geometry is not None else {}),
                 extinction_hardness=contextual.hardness_value)

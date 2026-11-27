@@ -25,6 +25,7 @@ from trainer.backend.memory.primitive_io import PrimitiveIO, gaussian_records
 from trainer.backend.optimize.adam import AdamOptimizer
 from trainer.backend.optimize.regularization import Regularizer
 from trainer.backend.render.backward import RasterBackward
+from trainer.backend.render.geometry import GeometryForward, GeometryTerms, compiled_with_geometry
 from trainer.backend.render.losses import ImageLoss
 from trainer.backend.render.mip_filter import MipFilter
 from trainer.backend.render.rasterizer import Rasterizer
@@ -34,6 +35,7 @@ from trainer.common.sh import sh_degree_from_rest_floats, sh_rest_coeffs
 from trainer.config.config import (
     AdamLRs,
     AppearanceConfig,
+    GeometryConfig,
     IterationContextualVariables,
     LossConfig,
     RasterConfig,
@@ -91,6 +93,7 @@ class TrainingPipeline:
         regularization_config: RegularizationConfig | None = None,
         appearance_config: AppearanceConfig | None = None,
         stbn_config: StbnConfig | None = None,
+        geometry_config: GeometryConfig | None = None,
         viewer_only: bool = False,
         initial_state: dict | None = None,
         use_persplat_backward: bool = True,
@@ -108,6 +111,12 @@ class TrainingPipeline:
         # take the active target texture as an extra argument, so this must match the session.
         defines = self.slang_session.desc.compiler_options.defines or {}
         self.loss_mask = bool(defines.get("LOSS_MASK"))
+        # GEOM_PRIORS (depth/normal losses) changes the forward's and the backward's arguments too.
+        self.geom_priors = compiled_with_geometry(self.slang_session)
+        self.geometry_config = geometry_config or GeometryConfig()
+        if self.geometry_config.image_terms and not self.geom_priors and not viewer_only:
+            raise RuntimeError("depth/normal/depth-normal weights are set but the pipeline was compiled "
+                               "without GEOM_PRIORS, so they would be ignored")
         self.width = width
         self.height = height
         self.max_splats = max_splats
@@ -173,11 +182,15 @@ class TrainingPipeline:
         self.scan = PrefixScan(commands, kernels, b.scan)
         self.sort = RadixSort(commands, kernels, b.sort)
         self.primitives = PrimitiveIO(commands, kernels, b.primitive, capacity, b.sh)
+        self.geometry_forward = (GeometryForward(
+            self.device, kernels, width=self.width, height=self.height, capacity=capacity,
+            plane_depth=self.geometry_config.depth_source == "plane") if self.geom_priors else None)
         self.rasterizer = Rasterizer(
             self.device, commands, kernels, primitive=b.primitive, raster=b.raster,
             sh=b.sh, scan=self.scan, sort=self.sort, config=self.raster_config,
             width=self.width, height=self.height, num_tiles_x=b.num_tiles_x,
-            num_tiles_y=b.num_tiles_y, capacity=capacity)
+            num_tiles_y=b.num_tiles_y, capacity=capacity, geometry=self.geometry_forward)
+        self.geometry = None
         self.targets = self.loss = self.backward = self.regularizer = None
         self.optimizer = self.densify_stats = self.mip_filter = self.opacity_reset = None
         self.simple_densifier = self.structure_densifier = self.morton = None
@@ -185,6 +198,11 @@ class TrainingPipeline:
             return
 
         visible = b.raster.cluster_visible
+        if self.geom_priors or self.geometry_config.flatten_weight > 0.0:
+            self.geometry = GeometryTerms(
+                self.device, commands, kernels, config=self.geometry_config,
+                forward=self.geometry_forward, width=self.width, height=self.height,
+                capacity=capacity, loss_mask=self.loss_mask)
         self.targets = TargetImages(self.device, commands, b.loss.target_image,
                                     self.width, self.height)
         self.loss = ImageLoss(commands, kernels, resources=b.loss, width=self.width,
@@ -195,7 +213,7 @@ class TrainingPipeline:
             image_gradient=b.loss.image_gradient, tracking=b.densification, sh=b.sh,
             scan=self.scan, capacity=capacity, max_sort_pairs=self.max_sort_pairs,
             per_splat=self.use_persplat_backward, per_bucket=self.use_flat_bucket_backward,
-            stbn_compacted=self.stbn_config.backward_compacted)
+            stbn_compacted=self.stbn_config.backward_compacted, geometry=self.geometry)
         self.regularizer = Regularizer(
             commands, kernels, primitive=b.primitive, gradients=b.gradients,
             cluster_visible=visible, config=self.regularization_config, capacity=capacity)
@@ -310,6 +328,10 @@ class TrainingPipeline:
         self.loss.record(rendered=self.buffers.raster.output_image,
                          target=self.targets.active,
                          stbn_kwargs=self._stbn_kwargs(contextual))
+        if self.geometry is not None:
+            self.geometry.record_loss(output_image=self.buffers.raster.output_image,
+                                      camera=self.rasterizer.camera_buffer,
+                                      loss_mask={"loss_mask": self.targets.active})
 
     def loss_mask_kwargs(self) -> dict:
         """The active target as ``loss_mask`` (its alpha is the keep mask) when masks are on."""

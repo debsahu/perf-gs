@@ -156,6 +156,9 @@ class ShaderSpecialization:
     # Per-image loss masks ride in the target's alpha (--masks): LOSS_MASK gates every per-pixel
     # training signal by it and turns alpha supervision off.
     loss_mask: bool = False
+    # Depth / normal / depth-normal losses (GEOM_PRIORS): the forward composites per-splat normal
+    # and depth beside color, and the backward carries their gradient.
+    geom_priors: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,3 +235,34 @@ class StructureConfig:
     dense_scale: float = 0.0
     detailed_diagnostics: bool = False  # full eta readback only when requested
     rank_split_families: bool = False  # allocate scarce slots by screen gradient per child
+
+
+@dataclass(frozen=True)
+class GeometryConfig:
+    """Depth-prior, normal-prior, depth-normal and flatten losses (all off by default).
+
+    Weights are Brush-equivalent: each term is a mean over its supervised pixels (flatten: over
+    live splats), scaled so a weight means what it means beside a per-pixel-mean L1."""
+
+    depth_weight: float = 0.0
+    normal_weight: float = 0.0
+    depth_normal_weight: float = 0.0
+    flatten_weight: float = 0.0
+    depth_source: str = "center"        # center | plane
+    depth_space: str = "disparity"      # disparity | metric | ssi
+    normal_loss: str = "l1"             # l1 | cos
+    normal_encoding: str = "slam"       # slam | spirula
+    min_alpha: float = 0.5
+    start_iter: int = 0                 # first step the three image terms are on
+    units_per_meter: float = 1.0
+    depth_dir: str | None = None
+    normal_dir: str | None = None
+
+    @property
+    def image_terms(self) -> bool:
+        """Whether any per-pixel term is on (the GEOM_PRIORS shaders are then required)."""
+        return max(self.depth_weight, self.normal_weight, self.depth_normal_weight) > 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.image_terms or self.flatten_weight > 0.0

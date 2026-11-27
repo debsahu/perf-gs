@@ -134,3 +134,10 @@ Project code: https://github.com/Po-Hsun-Su/pytorch-ssim\
 Copyright Evan Su, 2017
 
 License: https://github.com/Po-Hsun-Su/pytorch-ssim/blob/master/LICENSE.txt (MIT)
+
+### Depth and normal prior codecs
+
+The 8-bit normal and 16-bit millimetre depth codes read by `src/trainer/data/priors.py` (code 128 decodes to
+exactly 0, half-to-even rounding) follow the quantized prior format of gauss-surf (Apache-2.0,
+https://github.com/rerun-io/examples-monorepo). Only the two-line arithmetic of the format is reproduced; no source
+was copied.

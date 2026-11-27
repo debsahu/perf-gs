@@ -82,6 +82,36 @@ def require_loss_mask(args, pipeline) -> None:
                            "so the masks would be ignored")
 
 
+def load_priors(args, scene):
+    """The PriorDataset of --depth-dir / --normal-dir, or None. Indexed like the scene's images."""
+    depth_dir, normal_dir = getattr(args, "depth_dir", None), getattr(args, "normal_dir", None)
+    if not depth_dir and not normal_dir:
+        return None
+    from trainer.data.priors import PriorDataset
+    images = scene.colmapScene.images
+    intrinsics = []
+    for entry in images:
+        p = entry.camera.proj_matrix
+        intrinsics.append((float(p[0, 0]) * scene.width / 2, float(p[1, 1]) * scene.height / 2,
+                           (1.0 + float(p[0, 2])) * scene.width / 2, (1.0 + float(p[1, 2])) * scene.height / 2))
+    return PriorDataset([e.image_name for e in images], (scene.width, scene.height), intrinsics,
+                        native_sizes=[getattr(e, "native_size", None) for e in images],
+                        depth_dir=depth_dir, normal_dir=normal_dir,
+                        normal_encoding=getattr(args, "normal_encoding", "slam"),
+                        cache_views=2, decode_workers=2)
+
+
+def require_geometry(args, pipeline, priors) -> None:
+    """The image terms need the GEOM_PRIORS shaders; the prior textures take the priors' grids."""
+    from trainer.config.resolve import geometry_config
+    if geometry_config(args).image_terms and not getattr(pipeline, "geom_priors", False):
+        raise RuntimeError("depth/normal/depth-normal weights are set but the training pipeline was "
+                           "compiled without GEOM_PRIORS, so they would be ignored")
+    geometry = getattr(pipeline, "geometry", None)
+    if priors is not None and geometry is not None and geometry.image_terms:
+        geometry.set_prior_grids(priors.depth_hw, priors.normal_hw)
+
+
 def _keep_masks(targets):
     """The targets' per-camera loss keep masks, or None without --masks."""
     return getattr(targets, "keep_masks", None)
@@ -153,6 +183,7 @@ class TrainingApplication:
         self.learning_rate_schedule: LearningRateSchedule | None = None
         self.extinction_hardness_schedule: ExtinctionHardnessSchedule | None = None
         self.appearance_schedule: AppearanceSchedule | None = None
+        self.priors = None              # PriorDataset with --depth-dir / --normal-dir
 
     @classmethod
     def from_cli(cls) -> "TrainingApplication":
@@ -228,6 +259,9 @@ class TrainingApplication:
         if self.targets is not None:
             self.targets.close()
         self.targets = None
+        if getattr(self, "priors", None) is not None:
+            self.priors.close()
+        self.priors = None
         self.target_textures = {}
         self.structure_textures = {}
         self.scene_context = None
@@ -311,6 +345,8 @@ class TrainingApplication:
                    "targets_streamed": self._stream_targets,
                    **({"target_cache": self._targets.cache_stats()}
                       if getattr(self._targets, "compressed", False) else {}),
+                   **({"prior_cache": self.priors.cache_stats(), **self.priors.host_bytes()}
+                      if getattr(self, "priors", None) is not None else {}),
                    "allocated_bytes": owned}
         measured = query_video_memory(self.device.info.adapter_name)
         vram = ""
@@ -373,6 +409,7 @@ class TrainingApplication:
         )
         if self.args.write_ground_truths:
             self.targets.write_ground_truths(self.paths.cameras)
+        self.priors = load_priors(self.args, scene)
 
     def _create_device(self) -> None:
         """Create the GPU device and shared queue lock.
@@ -399,6 +436,7 @@ class TrainingApplication:
             slang_session=session,
         )
         require_loss_mask(self.args, self.pipeline)
+        require_geometry(self.args, self.pipeline, getattr(self, "priors", None))
         strength = getattr(self.args, "lens_strength", None)
         self._pipeline.rasterizer.natural_vignetting = self.args.natural_vignetting if strength is None else strength
         self._pipeline.mip_filter.set_cameras(
@@ -590,6 +628,7 @@ class TrainingApplication:
             extinction_hardness_scheduler=self.extinction_hardness_schedule, # same for this
             appearance_scheduler=self._appearance_schedule,
             paths=self.paths,
+            priors=getattr(self, "priors", None),
         )
 
     def _write_resolved_config(self) -> None:
@@ -809,6 +848,7 @@ class TrainingLoop:
         extinction_hardness_scheduler: ExtinctionHardnessSchedule | None = None,
         appearance_scheduler: AppearanceSchedule | None = None,
         paths: RunPaths,
+        priors=None,
     ) -> None:
         self.args = args
         self.scene = scene
@@ -822,6 +862,8 @@ class TrainingLoop:
         self.extinction_hardness_schedule: ExtinctionHardnessSchedule | None = extinction_hardness_scheduler
         self.appearance_schedule: AppearanceSchedule | None = appearance_scheduler
         self.paths = paths
+        self.priors = priors
+        self.geom_from = int(getattr(args, "geom_from", 0) or 0)
 
         rng = np.random.default_rng(args.seed)
         self.sampler = CameraSampler(
@@ -1004,6 +1046,13 @@ class TrainingLoop:
             # Compressed targets: keep this view and decode the sampler's next draws ahead.
             prefetch([context.camera_index, *self.sampler.peek(self.args.target_prefetch)])
         self.runtime.pipeline.targets.select(self.target_textures[context.camera_index])
+        geometry = getattr(self.runtime.pipeline, "geometry", None)
+        if geometry is not None:
+            # The same window as --target-prefetch, driven by the same sampler peek.
+            if getattr(self, "priors", None) is not None:
+                self.priors.prefetch([context.camera_index, *self.sampler.peek(self.args.target_prefetch)])
+                geometry.select(*self.priors.entry(context.camera_index))
+            geometry.active = context.step_number >= self.geom_from
 
         if context.step_number == 1:
             print(f"[determinism] iter 1 cam_idx={context.camera_index} (should match across same-seed runs)")
@@ -1078,6 +1127,15 @@ class TrainingLoop:
     def _produce_observations(self, context: IterationContext) -> bool:
         self.runtime.viewer.checkpoint()
         self.runtime.reporter.report_throughput(context)
+
+        geometry = getattr(self.runtime.pipeline, "geometry", None)
+        if context.events.log and geometry is not None and geometry.image_terms:
+            pipeline = self.runtime.pipeline
+            pipeline.runtime.wait_for_idle()
+            with pipeline.gpu_lock:
+                line = geometry.log_line(geometry.read_stats())
+            print(f"iter {context.step_number}: {line}", flush=True)
+            self.runtime.artifacts.log_txt.write(f"iter {context.step_number}: {line}\n")
 
         if context.step_number > 1 and (context.events.log or context.events.preview):
             ok, self.gaussian_count = self.runtime.reporter.report_iteration(

@@ -199,6 +199,7 @@ class DensificationResources:
     scratch_arena: ScratchArena
     actions: spy.NDBuffer
     valid_mask: spy.NDBuffer
+    child_offset: spy.NDBuffer        # per-parent tail offset (an exclusive prefix sum) at a densify tick
     pre_count: spy.NDBuffer
     post_count: spy.NDBuffer
     dispatch_args: spy.NDBuffer
@@ -507,6 +508,7 @@ def allocate(
         scratch_arena=scratch_arena,
         actions=actions,
         valid_mask=valid_mask,
+        child_offset=allocator.uint_buffer("densification.child_offset", max_splats),
         pre_count=allocator.uint_buffer("densification.pre_count", 1),
         post_count=allocator.uint_buffer("densification.post_count", 1),
         dispatch_args=allocator.indirect_buffer("densification.dispatch_args"),

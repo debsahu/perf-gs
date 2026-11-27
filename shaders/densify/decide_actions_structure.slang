@@ -37,8 +37,6 @@ void decideActionsStructure(
     RWStructuredBuffer<uint> split_factor_y,
     RWStructuredBuffer<uint> split_factor_z,
     RWStructuredBuffer<uint> densify_children_sum,  // atomic: total requested tail growth (for overbudget log)
-    RWStructuredBuffer<uint> selected_parents,
-    RWStructuredBuffer<uint> selected_count,
     uniform float tau_split, uniform float tau_prune,
     uniform float grad_threshold_internal,
     uniform float split_power, uniform uint max_split_factor,
@@ -109,19 +107,11 @@ void decideActionsStructure(
     split_factor_y[gaussian_idx] = nky;
     split_factor_z[gaussian_idx] = nkz;
 
-    // One reservation per wave; only these parents need split workgroups.
-    bool selected = out_action == ACTION_SPLIT || out_action == ACTION_CLONE;
-    uint wave_count = WaveActiveCountBits(selected);
-    uint offset = WavePrefixCountBits(selected);
-    uint base = 0u;
+    // The requested growth only feeds the overbudget report: an integer sum, so its order
+    // does not matter. The parent list is built in index order by allocate_children.slang.
     uint requested = out_action == ACTION_SPLIT ? nkx * nky * nkz - 1u
                    : (out_action == ACTION_CLONE ? 1u : 0u);
     uint wave_growth = WaveActiveSum(requested);
-    if (WaveIsFirstLane() && wave_count > 0u)
-    {
-        InterlockedAdd(selected_count[0], wave_count, base);
+    if (WaveIsFirstLane() && wave_growth > 0u)
         InterlockedAdd(densify_children_sum[0], wave_growth);
-    }
-    base = WaveReadLaneFirst(base);
-    if (selected) selected_parents[base + offset] = gaussian_idx;
 }

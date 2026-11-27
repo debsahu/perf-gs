@@ -12,19 +12,10 @@ uint priorityBin(float score)
     return uint(clamp(int(asuint(score) >> 20u) - (127 - 16) * 8, 0, int(BINS) - 1));
 }
 
-bool claimCutoffSlots(RWStructuredBuffer<uint> histogram, uint cost)
-{
-    uint available = histogram[REMAINING];
-    while (available >= cost)
-    {
-        uint observed;
-        InterlockedCompareExchange(histogram[REMAINING], available, available - cost, observed);
-        if (observed == available) return true;
-        available = observed;
-    }
-    return false;
-}
-
+// Upgrades in the cutoff bin share the slots left after every higher bin. They go to parents
+// in index order: a parent gets all of its cutoff-bin upgrades when the cutoff costs of every
+// lower-index parent plus its own fit (cutoff_offset is their exclusive prefix sum), else none
+// and it stops there. Pass 1 (apply = 1) measures each parent's cutoff cost; pass 2 grants.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_count,
@@ -32,6 +23,7 @@ void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_co
     RWStructuredBuffer<uint> factor_x, RWStructuredBuffer<uint> factor_y, RWStructuredBuffer<uint> factor_z,
     StructuredBuffer<uint> eta_x, StructuredBuffer<uint> eta_y, StructuredBuffer<uint> eta_z,
     StructuredBuffer<uint> views, StructuredBuffer<int64_t> gradient,
+    RWStructuredBuffer<uint> cutoff_cost, StructuredBuffer<uint> cutoff_offset,
     uniform float gradient_scale, uniform uint capacity, uniform uint apply)
 {
     uint i = tid.x;
@@ -43,6 +35,8 @@ void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_co
     float evidence = fromFixed(gradient[i]) / max(float(views[i]), 1.0) / gradient_scale;
     uint3 granted = uint3(1u);
     uint size = 1u;
+    uint cut = 0u;
+    bool cutoff_fits = apply == 2u && cutoff_offset[i] + cutoff_cost[i] <= histogram[REMAINING];
     for (uint level = 0u; level < 3u; ++level)
     {
         // Each upgrade adds one complete axis, strongest structure signal first.
@@ -64,11 +58,19 @@ void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_co
             uint cutoff = histogram[CUTOFF];
             if (bin < cutoff) break;
             if (bin == cutoff)
-                if (!claimCutoffSlots(histogram, cost)) break;
+            {
+                if (apply == 1u) cut += cost;
+                else if (!cutoff_fits) break;
+            }
             granted[axis] = factors[axis];
         }
         size = next_size;
         factors[axis] = 1u;
+    }
+    if (apply == 1u)
+    {
+        cutoff_cost[i] = cut;
+        return;
     }
     if (apply != 0u)
     {

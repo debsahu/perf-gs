@@ -76,7 +76,7 @@ void splitAndClone(
     uint3 dtid: SV_DispatchThreadID,
     RWStructuredBuffer<Gaussian3D> gaussians,
     RWStructuredBuffer<AdamState> adam_state,
-    RWStructuredBuffer<uint> num_gaussians_counter,
+    StructuredBuffer<uint> child_offset,   // exclusive prefix of the parents' growth (allocate_children.slang)
     RWStructuredBuffer<uint> action,
     // Pre-dispatch count snapshot (snapshotCount), so bumping the counter can't race the bounds check.
     StructuredBuffer<uint> pre_count_buf,
@@ -97,8 +97,7 @@ void splitAndClone(
         Gaussian3D c1 = _child_for_split(parent, i * 2u);
         Gaussian3D c2 = _child_for_split(parent, i * 2u + 1u);
 
-        uint tail;
-        InterlockedAdd(num_gaussians_counter[0], 1u, tail);
+        uint tail = pre_count + child_offset[i];
         if (tail >= max_splats)
         {
             action[i] = ACTION_KEEP;
@@ -113,8 +112,7 @@ void splitAndClone(
     {
         Gaussian3D clone = parent;
 
-        uint tail;
-        InterlockedAdd(num_gaussians_counter[0], 1u, tail);
+        uint tail = pre_count + child_offset[i];
         if (tail < max_splats)
         {
             gaussians[tail] = clone;
@@ -123,14 +121,14 @@ void splitAndClone(
     }
 }
 
-// splitAndClone plus the SH rest carry; must replace it, not run alongside (same atomic append).
+// splitAndClone plus the SH rest carry; must replace it, not run alongside (same tail slots).
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void splitAndCloneSH(
     uint3 dtid: SV_DispatchThreadID,
     RWStructuredBuffer<Gaussian3D> gaussians,
     RWStructuredBuffer<AdamState> adam_state,
-    RWStructuredBuffer<uint> num_gaussians_counter,
+    StructuredBuffer<uint> child_offset,   // exclusive prefix of the parents' growth (allocate_children.slang)
     RWStructuredBuffer<uint> action,
     StructuredBuffer<uint> pre_count_buf,
     RWStructuredBuffer<uint> features_rest,
@@ -152,8 +150,7 @@ void splitAndCloneSH(
         Gaussian3D c1 = _child_for_split(parent, i * 2u);
         Gaussian3D c2 = _child_for_split(parent, i * 2u + 1u);
 
-        uint tail;
-        InterlockedAdd(num_gaussians_counter[0], 1u, tail);
+        uint tail = pre_count + child_offset[i];
         if (tail >= max_splats)
         {
             action[i] = ACTION_KEEP;
@@ -171,8 +168,7 @@ void splitAndCloneSH(
     {
         Gaussian3D clone = parent;
 
-        uint tail;
-        InterlockedAdd(num_gaussians_counter[0], 1u, tail);
+        uint tail = pre_count + child_offset[i];
         if (tail < max_splats)
         {
             gaussians[tail] = clone;

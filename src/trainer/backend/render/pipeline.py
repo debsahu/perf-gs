@@ -187,6 +187,7 @@ class TrainingPipeline:
             sh=b.sh, scan=self.scan, sort=self.sort, config=self.raster_config,
             width=self.width, height=self.height, num_tiles_x=b.num_tiles_x,
             num_tiles_y=b.num_tiles_y, capacity=capacity)
+        self.rasterizer.write_checkpoints = not self.viewer_only   # the viewer's checkpoints are a stub
         self.targets = self.loss = self.backward = self.regularizer = None
         self.optimizer = self.densify_stats = self.mip_filter = self.opacity_reset = None
         self.simple_densifier = self.structure_densifier = self.morton = None

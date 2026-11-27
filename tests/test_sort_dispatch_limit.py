@@ -137,9 +137,10 @@ def test_allocation_refuses_checkpoints_past_4gib(gpu_device) -> None:
     sizes = dict(max_splats=16, width=16, height=16, sh_rest_floats=0)
     fits = max_sort_pairs_limit(1 << 31, num_tiles=4)
     assert estimate_allocation_bytes(module, max_sort_pairs=fits, **sizes) > _checkpoint_bytes(fits, 4)
-    for viewer_only in (False, True):
-        with pytest.raises(ValueError, match="raster_checkpoints"):
-            estimate_allocation_bytes(module, viewer_only=viewer_only, max_sort_pairs=402_653_184, **sizes)
+    with pytest.raises(ValueError, match="raster_checkpoints"):
+        estimate_allocation_bytes(module, max_sort_pairs=402_653_184, **sizes)
+    # the viewer binds a one-element checkpoint stub, so its sort capacity is bounded by the pair arrays only
+    estimate_allocation_bytes(module, viewer_only=True, max_sort_pairs=402_653_184, **sizes)
 
 
 def test_default_sort_pairs_stay_inside_the_checkpoint_range() -> None:
@@ -154,3 +155,48 @@ def test_dispatch_groups_x_falls_back_on_a_bad_device_value(groups) -> None:
     """A device that reports no usable width must not set the sort ceiling to 0 or crash."""
     dev = SimpleNamespace(info=SimpleNamespace(limits=SimpleNamespace(max_compute_dispatch_thread_groups=groups)))
     assert dispatch_groups_x(dev) == 65_535
+
+
+def test_every_storage_buffer_is_refused_past_4gib(gpu_device) -> None:
+    """Every storage buffer, not only raster_checkpoints, must fit one 4 GiB - 1 range: sh.adam_rest at SH degree 3
+    with fp32 moments passes it at ~11.9M splats, and an index past the range wraps silently on NVIDIA."""
+    from trainer.backend.memory.buffers import estimate_allocation_bytes
+    from trainer.backend.render.pipeline import TrainingPipeline
+    module = TrainingPipeline(gpu_device, 16, 16, max_splats=16).shared_data_module
+    sizes = dict(width=16, height=16, max_sort_pairs=1024, sh_rest_floats=45)
+    estimate_allocation_bytes(module, max_splats=11_000_000, **sizes)
+    with pytest.raises(ValueError, match="adam_rest"):
+        estimate_allocation_bytes(module, max_splats=12_000_000, **sizes)
+
+
+def test_the_device_allocator_refuses_a_buffer_past_4gib(monkeypatch) -> None:
+    """The guard sits in the allocator, so no buffer reaches the device oversized (none is allocated here)."""
+    from trainer.backend.memory import buffers
+    made = []
+    monkeypatch.setattr(buffers, "_make_labeled_ndbuffer", lambda *a, **k: made.append(a[2]))
+    alloc = buffers._Alloc(None, 1, 1)
+    alloc.typed_buffer("ok", "uint", (2**32 - 1) // 4)
+    with pytest.raises(ValueError, match="too_big"):
+        alloc.typed_buffer("too_big", "uint", 2**30)
+    with pytest.raises(ValueError, match="too_big_i64"):
+        alloc.i64_buffer("too_big_i64", 2**29)
+    assert made == [((2**32 - 1) // 4,)]
+
+
+def test_app_ceiling_counts_the_scene_frame_tiles(tmp_path, monkeypatch) -> None:
+    """At 128 x 128 (256 tiles) the ceiling is 8,192 pairs under the tile-less one: a capacity between the two must be
+    refused, which it is only if _prepare_scene passes the frame's tiles."""
+    from _colmap_testkit import write_colmap_scene
+    from trainer.backend.memory.buffers import frame_tiles
+    from trainer.frontend.app import TrainingApplication
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("trainer.frontend.app.dispatch_groups_x", lambda _device: 1 << 30)
+    scene = write_colmap_scene(tmp_path / "scene", views=[(f"{i}.png", 128, 128, 100.0) for i in range(2)])
+    tileless = max_sort_pairs_limit(1 << 30, num_tiles=0)
+    framed = max_sort_pairs_limit(1 << 30, num_tiles=frame_tiles(128, 128))
+    assert framed < tileless
+    args = build_parser().parse_args(["--scene", str(scene), "--no-viewer", "--max-sort-pairs", str(tileless),
+                                      "--width", "128", "--height", "128", "--no-write-ground-truths",
+                                      "--no-stereo-init"])
+    with pytest.raises(ConfigError, match="max-sort-pairs"):
+        TrainingApplication(args)._prepare_scene(scene)

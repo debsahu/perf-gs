@@ -204,3 +204,36 @@ def test_streamed_training_matches_resident(device, tmp_path, monkeypatch) -> No
     resident = _train_scene(device, tmp_path, monkeypatch, "gpu")
     streamed = _train_scene(device, tmp_path, monkeypatch, "stream")
     np.testing.assert_array_equal(resident, streamed)
+
+
+def test_viewer_writes_no_raster_checkpoints_and_renders_the_same(device) -> None:
+    """Only the backward reads raster_checkpoints, and the viewer has none: it binds a one-element stub, the forward
+    skips the writes, and the image is the training pipeline's, bit for bit."""
+    from trainer.data.dataset import simple_camera
+    camera = simple_camera(width=32, height=24, eye=(0.0, 0.0, 0.0), target=(0.0, 0.0, 1.0), fovy_degrees=60.0)
+    rng = np.random.default_rng(3)
+    n = 40
+    scene = dict(means=np.column_stack([rng.uniform(-0.8, 0.8, (n, 2)), rng.uniform(2.0, 4.0, n)]).astype(np.float32),
+                 log_scales=np.log(rng.uniform(0.05, 0.3, (n, 3))).astype(np.float32),
+                 rot_quats=np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1)),
+                 opacities=rng.uniform(0.3, 0.9, n).astype(np.float32),
+                 color_logits=rng.normal(size=(n, 3)).astype(np.float32))
+    images, flags = [], []
+    for viewer in (False, True):
+        p = TrainingPipeline(device, 32, 24, max_splats=64, viewer_only=viewer)
+        p.set_gaussians(**scene)
+        # A write past a one-element stub is dropped by robust buffer access, so the image alone cannot show it:
+        # check the forward is told not to write.
+        original = p.rasterizer._commands.dispatch
+
+        def dispatch(kernel, marker, **kwargs):
+            if marker == "forward":
+                flags.append(kwargs["write_checkpoints"])
+            return original(kernel, marker, **kwargs)
+        p.rasterizer._commands.dispatch = dispatch
+        p.render(camera)
+        images.append(p.read_output_image().copy())
+        if viewer:
+            assert p.buffers.raster.raster_checkpoints.storage.size == 8
+    assert images[0][..., 3].max() > 0.2 and np.array_equal(images[0], images[1])
+    assert flags == [1, 0]

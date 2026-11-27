@@ -31,7 +31,9 @@ void forwardRasterize(
     RWStructuredBuffer<uint2> raster_checkpoints,
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
-    uniform float extinction_hardness)
+    uniform float extinction_hardness,
+    // 0 for a render-only pipeline: no backward reads the checkpoints, and raster_checkpoints is a stub.
+    uniform uint write_checkpoints)
 {
     uint2 frame_dim_px = uint2(camera[0].image_size);
     uint2 tile_dim = uint2(TILE_WIDTH, TILE_HEIGHT);
@@ -65,10 +67,10 @@ void forwardRasterize(
     float3 C[PIXELS_PER_THREAD];
     float T[PIXELS_PER_THREAD];
     uint processed[PIXELS_PER_THREAD];
-    blendForward<GaussianSource, PIXELS_PER_THREAD>(
+    blendForwardImpl<GaussianSource, PIXELS_PER_THREAD>(
         src, t_start, tile_count, pixel_center, valid_pixel,
         pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
-        raster_checkpoints, extinction_hardness, C, T, processed);
+        raster_checkpoints, extinction_hardness, C, T, processed, write_checkpoints != 0u);
 
     [unroll]
     for (uint j = 0u; j < PIXELS_PER_THREAD; ++j)

@@ -55,6 +55,8 @@ class Rasterizer:
                  width: int, height: int, num_tiles_x: int, num_tiles_y: int,
                  capacity: int) -> None:
         self._commands = commands
+        # Only the backward reads raster_checkpoints: a render-only pipeline turns the writes off (stub buffer).
+        self.write_checkpoints = True
         self._k = kernels.load({**self.KERNELS,
                                 **(self.SH_KERNELS if sh is not None else {}),
                                 **(self.CULL_KERNELS if config.cluster_cull else {})})
@@ -232,6 +234,7 @@ class Rasterizer:
                 camera=self.camera_buffer,
                 bucket_offsets=r.bucket_offsets.storage,
                 raster_checkpoints=r.raster_checkpoints.storage,
+                write_checkpoints=int(self.write_checkpoints),
                 output_image=r.output_image,
                 gaussian_count_per_pixel=r.gaussian_count_per_pixel,
                 extinction_hardness=contextual.hardness_value)

@@ -14,7 +14,9 @@ static const float BLEND_ALPHA_MIN = 1.0 / 255.0;
 
 // Shared front-to-back tile blend (compositing, checkpoints, early-out) for any IPrimitiveSource, over
 // N pixels of one tile that share each primitive load.
-void blendForward<S : IPrimitiveSource, let N : int>(
+// write_checkpoints = false (a render-only viewer) skips the checkpoint writes: nothing reads them, so the
+// buffer may be a one-element stub. Colour, transmittance and counts are unchanged.
+void blendForwardImpl<S : IPrimitiveSource, let N : int>(
     S src,
     uint t_start,
     uint primitive_count,
@@ -27,7 +29,8 @@ void blendForward<S : IPrimitiveSource, let N : int>(
     float extinction_hardness,
     out float3 color[N],
     out float transmittance[N],
-    out uint processed[N])
+    out uint processed[N],
+    bool write_checkpoints)
 {
     Compositor compositor;
     compositor.hardness = extinction_hardness;
@@ -55,7 +58,7 @@ void blendForward<S : IPrimitiveSource, let N : int>(
         {
             if (!active[j])
                 continue;
-            if (bucket_start)
+            if (bucket_start && write_checkpoints)
                 raster_checkpoints[checkpointIndex(bucket, pixel_in_tile[j])] =
                     packCheckpoint(transmittance[j], color[j]);
 
@@ -72,6 +75,27 @@ void blendForward<S : IPrimitiveSource, let N : int>(
         if (!any_active)
             break;
     }
+}
+
+// blendForwardImpl writing every checkpoint (the backward reads them).
+void blendForward<S : IPrimitiveSource, let N : int>(
+    S src,
+    uint t_start,
+    uint primitive_count,
+    no_diff float2 pixel_center[N],
+    bool valid_pixel[N],
+    uint pixel_in_tile[N],
+    uint tile_bucket_base,
+    StructuredBuffer<uint> sorted_primitive_ids,
+    RWStructuredBuffer<uint2> raster_checkpoints,
+    float extinction_hardness,
+    out float3 color[N],
+    out float transmittance[N],
+    out uint processed[N])
+{
+    blendForwardImpl<S, N>(src, t_start, primitive_count, pixel_center, valid_pixel, pixel_in_tile,
+                           tile_bucket_base, sorted_primitive_ids, raster_checkpoints, extinction_hardness,
+                           color, transmittance, processed, true);
 }
 
 #endif // TRAINER_BLEND_FORWARD_SLANG

@@ -367,6 +367,20 @@ def _reflect_types(module: spy.Module) -> _ShaderTypes:
     )
 
 
+_SCALAR_STRIDES = {"uint": 4, "float": 4, "int64_t": 8, "uint2": 8, "float4": 16}
+
+
+def _element_stride(dtype) -> int:
+    return _SCALAR_STRIDES[dtype] if isinstance(dtype, str) else int(dtype.buffer_layout.reflection.stride)
+
+
+def _check_storage_range(label: str, size: int) -> None:
+    """Refuse a storage buffer past one storage-buffer range: a shader index past 4 GiB - 1 wraps silently (NVIDIA)."""
+    if size > STORAGE_BUFFER_RANGE:
+        raise ValueError(f"buffer {label!r} needs {size / 2**30:.2f} GiB, past the 4 GiB storage-buffer range; "
+                         "lower --max-splats (or the SH degree / sort capacity that sizes it)")
+
+
 @dataclass
 class _Alloc:
     """Buffer/texture factory bound to the device and frame size."""
@@ -375,6 +389,7 @@ class _Alloc:
     height: int
 
     def typed_buffer(self, label: str, dtype, *shape) -> spy.NDBuffer:
+        _check_storage_range(label, int(np.prod(shape)) * _element_stride(dtype))
         return _make_labeled_ndbuffer(
             self.device, dtype, shape, label, _DEFAULT_BUFFER_USAGE)
 
@@ -662,8 +677,8 @@ def allocate_viewer(
     bucket_count = allocator.uint_buffer("bucket_count", num_tiles)
     bucket_offsets = allocator.uint_buffer("bucket_offsets", num_tiles)
     bucket_offset_total = allocator.uint_buffer("bucket_offset_total", 1)
-    raster_checkpoints = allocator.typed_buffer(
-        "raster_checkpoints", "uint2", _checkpoint_elements(max_sort_pairs, num_tiles))
+    # The viewer's forward writes no checkpoints (only the backward reads them): a one-element stub.
+    raster_checkpoints = allocator.typed_buffer("raster_checkpoints", "uint2", 1)
     output_image = allocator.tex(spy.Format.rgba32_float, "output_image")
     gaussian_count_per_pixel = allocator.tex(spy.Format.r32_uint, "gaussian_count_per_pixel")
     scan = _allocate_scan(allocator, max_splats, with_work=False)
@@ -715,10 +730,8 @@ class _AllocationCounter:
 
     def typed_buffer(self, label, dtype, *shape):
         from types import SimpleNamespace
-        stride = ({"uint": 4, "float": 4, "int64_t": 8, "uint2": 8, "float4": 16}[dtype]
-                  if isinstance(dtype, str)
-                  else int(dtype.buffer_layout.reflection.stride))
-        size = int(np.prod(shape)) * stride
+        size = int(np.prod(shape)) * _element_stride(dtype)
+        _check_storage_range(label, size)
         self.total += size
         return SimpleNamespace(storage=SimpleNamespace(size=size),
                                copy_from_numpy=lambda _data: None)

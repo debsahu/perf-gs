@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Electronic Arts Inc. All rights reserved.
 
 // SAD-GS grid splitting: one workgroup per selected parent, lanes emit children
-// cooperatively. Child 0 replaces the parent; the rest share a tail reservation.
+// cooperatively. Child 0 replaces the parent; the rest go to the parent's tail range,
+// pre_count + child_offset[parent] (allocate_children.slang), whatever order groups run in.
 
 #include "../common/types.slang"
 #include "../common/math.slang"
@@ -49,10 +50,11 @@ Gaussian3D gridChild(ChildGrid grid, uint ordinal)
     return child;
 }
 
-// Snapshot the parent before child 0 overwrites its slot; reserve only once.
+// Snapshot the parent before child 0 overwrites its slot; look up its tail range.
 void prepareParent(uint i, uint lane, uint act,
     RWStructuredBuffer<Gaussian3D> gaussians,
-    RWStructuredBuffer<uint> num_gaussians_counter,
+    StructuredBuffer<uint> child_offset,
+    uint pre_count,
     StructuredBuffer<uint> split_factor_x,
     StructuredBuffer<uint> split_factor_y,
     StructuredBuffer<uint> split_factor_z)
@@ -62,10 +64,7 @@ void prepareParent(uint i, uint lane, uint act,
         s_parent = gaussians[i];
         s_factors = act == ACTION_CLONE ? uint3(1u) : uint3(
             max(split_factor_x[i], 1u), max(split_factor_y[i], 1u), max(split_factor_z[i], 1u));
-        uint growth = act == ACTION_CLONE ? 1u
-                   : s_factors.x * s_factors.y * s_factors.z - 1u;
-        s_tail = 0u;
-        if (growth > 0u) InterlockedAdd(num_gaussians_counter[0], growth, s_tail);
+        s_tail = pre_count + child_offset[i];
     }
     GroupMemoryBarrierWithGroupSync();
 }
@@ -84,7 +83,7 @@ void splitAnisotropic(
     uint3 gtid: SV_GroupThreadID,
     RWStructuredBuffer<Gaussian3D> gaussians,
     RWStructuredBuffer<AdamState> adam_state,
-    RWStructuredBuffer<uint> num_gaussians_counter,
+    StructuredBuffer<uint> child_offset,
     StructuredBuffer<uint> action,
     StructuredBuffer<uint> split_factor_x,
     StructuredBuffer<uint> split_factor_y,
@@ -102,7 +101,7 @@ void splitAnisotropic(
     uint lane = gtid.x;
     uint act = action[i];
     if (act != ACTION_SPLIT && act != ACTION_CLONE) return;
-    prepareParent(i, lane, act, gaussians, num_gaussians_counter,
+    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0],
                   split_factor_x, split_factor_y, split_factor_z);
     if (act == ACTION_CLONE)
     {
@@ -134,7 +133,7 @@ void splitAnisotropicSH(
     uint3 gtid: SV_GroupThreadID,
     RWStructuredBuffer<Gaussian3D> gaussians,
     RWStructuredBuffer<AdamState> adam_state,
-    RWStructuredBuffer<uint> num_gaussians_counter,
+    StructuredBuffer<uint> child_offset,
     StructuredBuffer<uint> action,
     StructuredBuffer<uint> split_factor_x,
     StructuredBuffer<uint> split_factor_y,
@@ -155,7 +154,7 @@ void splitAnisotropicSH(
     uint lane = gtid.x;
     uint act = action[i];
     if (act != ACTION_SPLIT && act != ACTION_CLONE) return;
-    prepareParent(i, lane, act, gaussians, num_gaussians_counter,
+    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0],
                   split_factor_x, split_factor_y, split_factor_z);
 
     if (act == ACTION_CLONE)

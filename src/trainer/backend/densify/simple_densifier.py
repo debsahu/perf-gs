@@ -27,7 +27,9 @@ class SimpleDensifier:
         "decide_actions": ("densify/decide_actions_simple.slang", "decideActionsSimple"),
         "snapshot_count": (_DISPATCH, "snapshotCount"),
         "prepare_dispatch": (_DISPATCH, "prepareDensifyArgs"),
-        "split_and_clone": ("densify/split_and_clone.slang", "splitAndClone"),
+        "mark_growth": ("densify/allocate_children.slang", "markSimpleGrowth"),
+    "finish_allocation": ("densify/allocate_children.slang", "finishAllocation"),
+    "split_and_clone": ("densify/split_and_clone.slang", "splitAndClone"),
         "split_and_clone_sh": ("densify/split_and_clone.slang", "splitAndCloneSH"),
         "build_prune_mask": ("densify/build_prune_mask.slang", "buildPruneMask"),
         "scatter_compact_gaussian": (_COMPACT, "scatterCompactGaussian"),
@@ -102,10 +104,20 @@ class SimpleDensifier:
                 count_buf=r.pre_count.storage,
                 dispatch_args=r.dispatch_args.storage,
                 max_splats=capacity)
+            # Each split or clone gets tail slot pre_count + (its rank among lower-index parents).
+            commands.dispatch(k.mark_growth, "mark_simple_growth",
+                thread_count=[capacity, 1, 1], action=r.actions.storage,
+                pre_count_buf=r.pre_count.storage, scratch=r.child_offset.storage,
+                max_splats=capacity)
+            self.scan.scan(capacity, r.child_offset, r.child_offset, r.post_count)
+            commands.dispatch(k.finish_allocation, "finish_child_allocation",
+                thread_count=[1, 1, 1], pre_count_buf=r.pre_count.storage,
+                growth_total=r.post_count.storage,
+                num_gaussians_counter=primitive.active_count.storage)
             split_kwargs = dict(
                 gaussians=primitive.values.storage,
                 adam_state=adam.state.storage,
-                num_gaussians_counter=primitive.active_count.storage,
+                child_offset=r.child_offset.storage,
                 action=r.actions.storage,
                 pre_count_buf=r.pre_count.storage,
                 max_splats=capacity)

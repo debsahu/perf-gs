@@ -30,6 +30,7 @@ _COMPACT = "densify/scatter_compact.slang"
 _SCORE = "densify/score_structure_aware.slang"
 _SPLIT = "densify/split_anisotropic.slang"
 _RANK = "densify/rank_families.slang"
+_ALLOCATE = "densify/allocate_children.slang"
 FIXED_POINT_SCALE = 65536.0
 
 
@@ -42,6 +43,9 @@ class StructureDensifier:
         "prepare_dispatch": (_DISPATCH, "prepareDensifyArgs"),
         "prepare_split": (_DISPATCH, "prepareStructureSplitArgs"),
         "decide_actions": ("densify/decide_actions_structure.slang", "decideActionsStructure"),
+        "mark_parents": (_ALLOCATE, "markParents"),
+        "list_parents": (_ALLOCATE, "listParentsAndGrowth"),
+        "finish_allocation": (_ALLOCATE, "finishAllocation"),
         "split": (_SPLIT, "splitAnisotropic"),
         "split_sh": (_SPLIT, "splitAnisotropicSH"),
         "build_prune_mask": ("densify/build_prune_mask.slang", "buildPruneMask"),
@@ -152,7 +156,7 @@ class StructureDensifier:
                 thread_count=[1, 1, 1], count_buf=r.pre_count.storage,
                 dispatch_args=r.dispatch_args.storage, max_splats=capacity)
 
-            # Decide: action + per-axis split factors; selected parents go to the scan scratch.
+            # Decide: action + per-axis split factors.
             commands.dispatch_indirect(k.decide_actions, "decide_actions_structure",
                 r.dispatch_args,
                 densify_children_sum=split.children_sum.storage,
@@ -179,9 +183,7 @@ class StructureDensifier:
                 t_opacity=cfg.t_opacity,
                 dense_scale=cfg.dense_scale,
                 min_blend_weight=float(min_blend_weight),
-                max_splats=capacity,
-                selected_parents=r.valid_mask.storage,
-                selected_count=selected_count.storage)
+                max_splats=capacity)
 
             if cfg.rank_split_families:
                 # The depth sort has finished and clears its own histogram on next use.
@@ -194,14 +196,40 @@ class StructureDensifier:
                             factor_z=split.split_factor_z.storage, eta_x=eta["max_x"].storage,
                             eta_y=eta["max_y"].storage, eta_z=eta["max_z"].storage,
                             views=r.visibility_count.storage, gradient=r.grad_mean_2d_mag.storage,
+                            cutoff_cost=r.child_offset.storage, cutoff_offset=scan_offsets.storage,
                             gradient_scale=self._grad_threshold(cfg) or 1.0)
                 rank = self._kernel_library.kernel(_RANK, "rankFamilies")
                 commands.dispatch_indirect(rank, "score_family_upgrades", r.dispatch_args, apply=0, **args)
                 commands.dispatch(self._kernel_library.kernel(_RANK, "chooseCutoff"), "budget_family_upgrades",
                     thread_count=[1, 1, 1], **common)
-                commands.dispatch_indirect(rank, "admit_family_upgrades", r.dispatch_args, apply=1, **args)
+                # Cutoff-bin upgrades are admitted in parent-index order (see rank_families.slang).
+                commands.dispatch(k.clear_uint, "clear_cutoff_cost",
+                    thread_count=[capacity, 1, 1], buffer=r.child_offset.storage, count=capacity)
+                commands.dispatch_indirect(rank, "measure_cutoff_upgrades", r.dispatch_args, apply=1, **args)
+                self._scan.scan(capacity, r.child_offset, scan_offsets)
+                commands.dispatch_indirect(rank, "admit_family_upgrades", r.dispatch_args, apply=2, **args)
 
-            # One cooperative workgroup per selected parent; children go to the tail.
+            # Child slots in parent-index order: the parent list and each parent's tail offset
+            # are exclusive prefix sums, so no slot depends on the order workgroups run in.
+            alloc = dict(action=r.actions.storage, pre_count_buf=r.pre_count.storage, max_splats=capacity)
+            commands.dispatch(k.mark_parents, "mark_split_parents",
+                thread_count=[capacity, 1, 1], scratch=r.child_offset.storage, **alloc)
+            self._scan.scan(capacity, r.child_offset, scan_offsets, selected_count)
+            commands.dispatch(k.list_parents, "list_split_parents",
+                thread_count=[capacity, 1, 1],
+                split_factor_x=split.split_factor_x.storage,
+                split_factor_y=split.split_factor_y.storage,
+                split_factor_z=split.split_factor_z.storage,
+                parent_rank=scan_offsets.storage,
+                selected_parents=r.valid_mask.storage,
+                scratch=r.child_offset.storage, **alloc)
+            self._scan.scan(capacity, r.child_offset, r.child_offset, r.post_count)
+            commands.dispatch(k.finish_allocation, "finish_child_allocation",
+                thread_count=[1, 1, 1], pre_count_buf=r.pre_count.storage,
+                growth_total=r.post_count.storage,
+                num_gaussians_counter=primitive.active_count.storage)
+
+            # One cooperative workgroup per selected parent; children go to its tail range.
             commands.dispatch(k.prepare_split, "structure_split_prepare_args",
                 thread_count=[1, 1, 1],
                 count_buf=selected_count.storage,
@@ -210,7 +238,7 @@ class StructureDensifier:
             split_kwargs = dict(
                 gaussians=primitive.values.storage,
                 adam_state=adam.state.storage,
-                num_gaussians_counter=primitive.active_count.storage,
+                child_offset=r.child_offset.storage,
                 action=r.actions.storage,
                 split_factor_x=split.split_factor_x.storage,
                 split_factor_y=split.split_factor_y.storage,

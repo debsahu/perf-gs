@@ -118,6 +118,8 @@ class RunConfig:
                 t_opacity_reset_value=args.opacity_reset_value,
                 reset_relative=args.sad_relative_reset,
                 reset_decay=args.sad_reset_decay,
+                cap_order=getattr(args, "cap_order", "hash"),
+                cap_seed=int(getattr(args, "seed", 0)),
             ),
             structure=StructureConfig(
                 n_scoring_views=args.n_scoring_views,
@@ -132,6 +134,8 @@ class RunConfig:
                 dense_scale=args.grow_scale3d * scene_extent,
                 rank_split_families=args.preset in ("quality", "quality+"),
                 detailed_diagnostics=bool(args.densify_diag),
+                cap_order=getattr(args, "cap_order", "hash"),
+                cap_seed=int(getattr(args, "seed", 0)),
             ),
             base_lrs=base_lrs,
             position_lr_max_steps=(schedule.optimization_steps if args.position_lr_max_steps <= 0

@@ -86,6 +86,7 @@ def _structure_reference(parents, actions, factors, cap, ks):
 
 
 def _densify_structure(p, **cfg):
+    cfg.setdefault("cap_order", "index")                # the CPU references below are index order
     return p.structure_densifier.densify(StructureConfig(opacity_cap=0, dense_scale=0.05, **cfg))
 
 
@@ -221,7 +222,7 @@ def test_simple_slots_match_cpu_reference(gpu_device, cap) -> None:
     n = 1000
     p = _setup(gpu_device, max_splats=cap)
     parents, hot, big = _simple_population(p, n, seed=3)
-    p.simple_densifier.run(DensifyConfig(), grad_thresh=0.0002, scale_thresh=0.05, allow_scale_prune=False)
+    p.simple_densifier.run(DensifyConfig(cap_order="index"), grad_thresh=0.0002, scale_thresh=0.05, allow_scale_prune=False)
     actions = _u32(p.buffers.densification.actions, n)
     assert big[hot].any() and (~big[hot]).any()         # both splits and clones requested
     expected_owner = hot[:max(0, cap - n)]
@@ -339,7 +340,7 @@ def test_sh_simple_layout_matches_reference(gpu_device, cap) -> None:
     n = 1000
     p = _setup(gpu_device, max_splats=cap, sh_degree=3)
     _, hot, _ = _simple_population(p, n, seed=3)
-    p.simple_densifier.run(DensifyConfig(), grad_thresh=0.0002, scale_thresh=0.05, allow_scale_prune=False)
+    p.simple_densifier.run(DensifyConfig(cap_order="index"), grad_thresh=0.0002, scale_thresh=0.05, allow_scale_prune=False)
     expected_owner = hot[:max(0, cap - n)]
     live = n + len(expected_owner)
     assert _count(p) == live
@@ -434,3 +435,144 @@ def test_radix_sort_ties_keep_input_order_and_repeat(radix_kernels) -> None:
     for _ in range(3):
         _, _, got_v = _radix_sort(device, kernels, keys_lo, keys_hi, values)
         np.testing.assert_array_equal(got_v, values[order])
+
+
+# ---------------------------------------------------------------- cap order: hash thinning
+
+def _pcg(v):
+    v = np.asarray(v, dtype=np.uint64) & 0xFFFFFFFF
+    state = (v * 747796405 + 2891336453) & 0xFFFFFFFF
+    word = (((state >> ((state >> 28) + 4)) ^ state) * 277803737) & 0xFFFFFFFF
+    return (word >> 22) ^ word
+
+
+def _hash_bins(n, tick, seed):
+    return (_pcg(np.arange(n, dtype=np.uint64) ^ _pcg(np.uint64(tick) ^ _pcg(np.uint64(seed)))) >> 24).astype(np.int64)
+
+
+def _hash_admitted(cost, budget, tick, seed):
+    """CPU reference of the hash-order admission: lowest hash bins whole, the cutoff bin in index order."""
+    bins = _hash_bins(len(cost), tick, seed)
+    hist = np.bincount(bins, weights=cost, minlength=256).astype(np.int64)
+    slots, cutoff = int(budget), 0
+    while cutoff < 256 and hist[cutoff] <= slots:
+        slots -= hist[cutoff]
+        cutoff += 1
+    admitted = (cost > 0) & (bins < cutoff)
+    prefix = 0
+    for i in np.flatnonzero((cost > 0) & (bins == cutoff)):
+        if prefix + cost[i] <= slots:
+            admitted[i] = True
+        prefix += cost[i]
+    return admitted | (cost == 0)
+
+
+def _growth(p, n, actions_before=None):
+    actions = _u32(p.buffers.densification.actions, n) if actions_before is None else actions_before
+    fx, fy, fz = (_u32(getattr(p.buffers.structure, f"split_factor_{a}"), n) for a in "xyz")
+    grid = np.maximum(fx, 1).astype(np.int64) * np.maximum(fy, 1) * np.maximum(fz, 1)
+    return np.where(actions == 2, 1, np.where(actions == 1, grid - 1, 0))
+
+
+@pytest.mark.parametrize("seed,tick", [(0, 300), (7, 1900)])
+def test_hash_thinning_matches_cpu_reference(gpu_device, seed, tick) -> None:
+    """Unranked, the cap binding hard: exactly the parents the CPU hash order admits keep their children,
+    laid out in index order; the rest keep their parent; the budget is never exceeded."""
+    n, cap = 4000, 7000
+    roomy = _setup(gpu_device, max_splats=40_000)
+    _population(roomy, n, seed=5)
+    _densify_structure(roomy, cap_order="index")
+    cost = _growth(roomy, n)                             # what each parent asks for, before any thinning
+    assert n + cost.sum() > cap
+    p = _setup(gpu_device, max_splats=cap)
+    parents = _population(p, n, seed=5)
+    p.structure_densifier.densify(StructureConfig(opacity_cap=0, dense_scale=0.05, cap_order="hash",
+                                                  cap_seed=seed), tick=tick)
+    want = _hash_admitted(cost, cap - n, tick, seed)
+    actions = _u32(p.buffers.densification.actions, n)
+    got = (actions == 1) | (actions == 2) | (cost == 0)
+    np.testing.assert_array_equal(got, want)
+    kept_growth = int(cost[want & (cost > 0)].sum())
+    assert kept_growth <= cap - n and cap - n - kept_growth <= cost.max()     # leftover < one family
+    assert _count(p) == n + kept_growth
+    owners = np.rint(_read_gaussians(p, n + kept_growth)[n:, 0] / SPACING).astype(int)
+    np.testing.assert_array_equal(owners, np.repeat(np.arange(n), np.where(want, cost, 0)))
+    dropped = np.flatnonzero(~want)
+    np.testing.assert_array_equal(_read_gaussians(p, n)[dropped], parents[dropped])
+
+
+def test_hash_reference_discriminates(gpu_device) -> None:
+    """The reference can fail: another seed or tick admits a different set, and index order is not it."""
+    cost = np.ones(5000, np.int64)
+    a = _hash_admitted(cost, 1500, 300, 0)
+    assert a.sum() == 1500
+    assert not np.array_equal(a, _hash_admitted(cost, 1500, 400, 0))
+    assert not np.array_equal(a, _hash_admitted(cost, 1500, 300, 1))
+    assert not np.array_equal(a, np.arange(5000) < 1500)
+
+
+def _decile_shares(indices, n):
+    return np.bincount(np.minimum(indices * 10 // n, 9), minlength=10) / max(len(indices), 1)
+
+
+@pytest.mark.parametrize("mode", ["structure", "simple"])
+def test_hash_survivors_spread_over_the_index_range(gpu_device, mode) -> None:
+    """Index order is Morton order after a reorder. A quarter of 20,000 clone requests fit: index order
+    keeps the first 25% of the range, hash order keeps every tenth of the range nearly equally."""
+    n, room = 20_000, 5_000
+    shares = {}
+    for order in ("index", "hash"):
+        p = _setup(gpu_device, max_splats=n + room)
+        if mode == "structure":
+            _population(p, n, seed=8, clone_fraction=1.0, keep_fraction=0.0)
+            _densify_structure(p, cap_order=order)
+            kept = np.rint(_read_gaussians(p, _count(p))[n:, 0] / SPACING).astype(int)
+        else:
+            _simple_population(p, n, seed=8)
+            grad = np.zeros(p.max_splats, np.int64)
+            grad[:n] = 65536 * 1000
+            p.buffers.densification.grad_mean_2d_mag.copy_from_numpy(grad)
+            p.simple_densifier.run(DensifyConfig(cap_order=order), grad_thresh=0.0002, scale_thresh=10.0,
+                                   allow_scale_prune=False)            # every splat asks to clone
+            owners = np.rint(_read_gaussians(p, _count(p))[n:, 0] / SPACING).astype(int)
+            kept = owners
+        assert len(kept) == room
+        shares[order] = _decile_shares(kept, n)
+    assert shares["index"][:2].sum() > 0.79 and shares["index"][3:].sum() == 0
+    assert shares["hash"].min() > 0.08 and shares["hash"].max() < 0.12, shares["hash"]
+
+
+def test_hash_ranked_cutoff_is_all_or_nothing_and_spread(gpu_device) -> None:
+    """Ranked, hash order inside the cutoff bin: exactly `room` single-child families split, spread over
+    the range; and at a cost of two per parent no family is cut."""
+    n, room = 6000, 3000
+    p = _setup(gpu_device, max_splats=n + room)
+    _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    _one_axis(p)
+    _densify_structure(p, rank_split_families=True, cap_order="hash")
+    actions = _u32(p.buffers.densification.actions, n)
+    split = np.flatnonzero(actions == 1)
+    assert len(split) == room and set(np.unique(actions)) == {0, 1}
+    assert _decile_shares(split, n).min() > 0.08
+    assert _count(p) == n + room
+    q = _setup(gpu_device, max_splats=6 + 6 + 3)
+    _population(q, 6, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    q.buffers.eta.components["max_z"].copy_from_numpy(np.zeros(q.max_splats, np.uint32))
+    _densify_structure(q, rank_split_families=True, cap_order="hash")
+    f = np.stack([_u32(getattr(q.buffers.structure, f"split_factor_{a}"), 6) for a in "xyz"], axis=1)
+    assert sorted(f.prod(axis=1).tolist()) == [2, 2, 2, 2, 2, 4], f.tolist()
+
+
+def test_hash_thinning_repeats_and_never_exceeds_the_cap(gpu_device) -> None:
+    """20,000 mixed parents over a hard cap, eight times: one result, at most the cap."""
+    n, cap = 20_000, 40_000
+    p = _setup(gpu_device, max_splats=cap)
+    results = set()
+    for _ in range(8):
+        _population(p, n, seed=6)
+        p.structure_densifier.densify(StructureConfig(opacity_cap=0, dense_scale=0.05, cap_order="hash"), tick=500)
+        count = _count(p)
+        assert n < count <= cap
+        values = p.buffers.primitive.values.to_numpy().view(np.uint8).reshape(cap, -1)[:count]
+        results.add((count, values.tobytes()))
+    assert len(results) == 1

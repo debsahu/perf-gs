@@ -11,6 +11,7 @@ import slangpy as spy
 from trainer.backend.compute.algorithms import PrefixScan
 from trainer.backend.compute.gpu import CommandRecorder
 from trainer.backend.compute.kernels import KernelLibrary
+from trainer.backend.densify.cap_order import CapOrder
 from trainer.config.config import StructureConfig
 from trainer.backend.densify.opacity import OpacityReset
 from trainer.backend.memory.arena import ArenaCommitter
@@ -79,6 +80,7 @@ class StructureDensifier:
         self._width = width
         self._height = height
         self._capacity = capacity
+        self._cap = CapOrder(commands, kernels, resources, scan, capacity)
 
     def clear_scores(self) -> None:
         """Start a new accumulation window (after any slot permutation that dropped eta)."""
@@ -110,12 +112,12 @@ class StructureDensifier:
             pass_idx=int(pass_idx) & 0xFFFF,
             max_splats=self._capacity)
 
-    def densify(self, cfg: StructureConfig, min_blend_weight: float = 0.0) -> dict:
+    def densify(self, cfg: StructureConfig, min_blend_weight: float = 0.0, tick: int = 0) -> dict:
         """Split/clone the splats the window flagged, prune, compact, cap opacity.
 
         Read back the requested growth to report capacity pressure.
         """
-        self._record_densify(cfg, min_blend_weight)
+        self._record_densify(cfg, min_blend_weight, tick)
         self._commands.runtime.wait_for_submit(self._commands.last_submit_id)
         children = int(self._split_resources.children_sum.storage.to_numpy().view(np.uint32)[0])
         pre_count = int(self._densification_resources.pre_count.storage.to_numpy().view(np.uint32)[0])
@@ -124,7 +126,8 @@ class StructureDensifier:
         if overbudget:
             share = children / pre_count if pre_count > 0 else 0.0
             policy = ("ranked complete split families" if cfg.rank_split_families
-                      else "overflow children DROPPED at the tail")
+                      else "a uniform hash-ordered subset of complete families kept"
+                      if cfg.cap_order == "hash" else "overflow children DROPPED at the tail")
             print(f"Structure densify overbudget at {pre_count} splats — "
                   f"requested {children} new children ({share:.0%} of the "
                   f"population) but only {headroom} fit (max_splats="
@@ -138,7 +141,7 @@ class StructureDensifier:
         # Same convention scaling as the simple densifier.
         return cfg.grad_threshold * (self._width * self._height * 3.0)
 
-    def _record_densify(self, cfg: StructureConfig, min_blend_weight: float) -> None:
+    def _record_densify(self, cfg: StructureConfig, min_blend_weight: float, tick: int = 0) -> None:
         commands, k, capacity = self._commands, self._kernels, self._capacity
         primitive, adam, r, split = self._primitive, self._adam_resources, self._densification_resources, self._split_resources
         eta, sh, arena = self.eta_resources.components, self._sh_resources, self._arena
@@ -196,18 +199,23 @@ class StructureDensifier:
                             factor_z=split.split_factor_z.storage, eta_x=eta["max_x"].storage,
                             eta_y=eta["max_y"].storage, eta_z=eta["max_z"].storage,
                             views=r.visibility_count.storage, gradient=r.grad_mean_2d_mag.storage,
-                            cutoff_cost=r.child_offset.storage, cutoff_offset=scan_offsets.storage,
+                            cutoff_cost=r.child_offset.storage, cutoff_admit=r.valid_mask.storage,
                             gradient_scale=self._grad_threshold(cfg) or 1.0)
                 rank = self._kernel_library.kernel(_RANK, "rankFamilies")
                 commands.dispatch_indirect(rank, "score_family_upgrades", r.dispatch_args, apply=0, **args)
                 commands.dispatch(self._kernel_library.kernel(_RANK, "chooseCutoff"), "budget_family_upgrades",
                     thread_count=[1, 1, 1], **common)
-                # Cutoff-bin upgrades are admitted in parent-index order (see rank_families.slang).
+                # Cutoff-bin upgrades, all or nothing per parent, in cfg.cap_order (cap_order.py).
                 commands.dispatch(k.clear_uint, "clear_cutoff_cost",
                     thread_count=[capacity, 1, 1], buffer=r.child_offset.storage, count=capacity)
                 commands.dispatch_indirect(rank, "measure_cutoff_upgrades", r.dispatch_args, apply=1, **args)
-                self._scan.scan(capacity, r.child_offset, scan_offsets)
+                self._cap.admit(cfg.cap_order, r.child_offset, self._raster_resources.depth_sort.global_hist,
+                                513, r.valid_mask, tick, cfg.cap_seed)
                 commands.dispatch_indirect(rank, "admit_family_upgrades", r.dispatch_args, apply=2, **args)
+            else:
+                # Without ranking: when the requests overflow the cap, keep a cfg.cap_order subset.
+                self._cap.thin(cfg.cap_order, tick, cfg.cap_seed, simple=False,
+                               factors=(split.split_factor_x, split.split_factor_y, split.split_factor_z))
 
             # Child slots in parent-index order: the parent list and each parent's tail offset
             # are exclusive prefix sums, so no slot depends on the order workgroups run in.

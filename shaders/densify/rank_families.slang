@@ -12,10 +12,9 @@ uint priorityBin(float score)
     return uint(clamp(int(asuint(score) >> 20u) - (127 - 16) * 8, 0, int(BINS) - 1));
 }
 
-// Upgrades in the cutoff bin share the slots left after every higher bin. They go to parents
-// in index order: a parent gets all of its cutoff-bin upgrades when the cutoff costs of every
-// lower-index parent plus its own fit (cutoff_offset is their exclusive prefix sum), else none
-// and it stops there. Pass 1 (apply = 1) measures each parent's cutoff cost; pass 2 grants.
+// Upgrades in the cutoff bin share the slots left after every higher bin, all or nothing per parent.
+// Pass 1 (apply = 1) measures each parent's cutoff cost; allocate_children.slang then decides which
+// parents fit (cutoff_admit: hash order, or index order with --cap-order index); pass 2 grants.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_count,
@@ -23,7 +22,7 @@ void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_co
     RWStructuredBuffer<uint> factor_x, RWStructuredBuffer<uint> factor_y, RWStructuredBuffer<uint> factor_z,
     StructuredBuffer<uint> eta_x, StructuredBuffer<uint> eta_y, StructuredBuffer<uint> eta_z,
     StructuredBuffer<uint> views, StructuredBuffer<int64_t> gradient,
-    RWStructuredBuffer<uint> cutoff_cost, StructuredBuffer<uint> cutoff_offset,
+    RWStructuredBuffer<uint> cutoff_cost, StructuredBuffer<uint> cutoff_admit,
     uniform float gradient_scale, uniform uint capacity, uniform uint apply)
 {
     uint i = tid.x;
@@ -36,7 +35,7 @@ void rankFamilies(uint3 tid : SV_DispatchThreadID, StructuredBuffer<uint> pre_co
     uint3 granted = uint3(1u);
     uint size = 1u;
     uint cut = 0u;
-    bool cutoff_fits = apply == 2u && cutoff_offset[i] + cutoff_cost[i] <= histogram[REMAINING];
+    bool cutoff_fits = apply == 2u && cutoff_admit[i] != 0u;
     for (uint level = 0u; level < 3u; ++level)
     {
         // Each upgrade adds one complete axis, strongest structure signal first.

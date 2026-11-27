@@ -7,6 +7,7 @@ from __future__ import annotations
 from trainer.backend.compute.algorithms import PrefixScan
 from trainer.backend.compute.gpu import CommandRecorder
 from trainer.backend.compute.kernels import KernelLibrary
+from trainer.backend.densify.cap_order import CapOrder
 from trainer.backend.memory.arena import ArenaCommitter
 from trainer.backend.memory.buffers import (
     AdamResources,
@@ -57,6 +58,7 @@ class SimpleDensifier:
         self.width = width
         self.height = height
         self.max_primitives = max_primitives
+        self.cap = CapOrder(commands, kernels, resources, scan, max_primitives)
 
     def run(
         self,
@@ -67,6 +69,7 @@ class SimpleDensifier:
         allow_scale_prune: bool = True,
         carry_eta: bool = False,
         min_blend_weight: float = 0.0,
+        tick: int = 0,
     ) -> dict:
         if carry_eta and self.eta is None:
             raise RuntimeError("carry_eta requires EtaResources")
@@ -104,7 +107,9 @@ class SimpleDensifier:
                 count_buf=r.pre_count.storage,
                 dispatch_args=r.dispatch_args.storage,
                 max_splats=capacity)
-            # Each split or clone gets tail slot pre_count + (its rank among lower-index parents).
+            # Over the cap, keep a cfg.cap_order subset; then each split or clone gets tail slot
+            # pre_count + (its rank among lower-index parents).
+            self.cap.thin(getattr(cfg, "cap_order", "hash"), tick, getattr(cfg, "cap_seed", 0), simple=True)
             commands.dispatch(k.mark_growth, "mark_simple_growth",
                 thread_count=[capacity, 1, 1], action=r.actions.storage,
                 pre_count_buf=r.pre_count.storage, scratch=r.child_offset.storage,

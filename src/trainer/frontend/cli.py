@@ -315,6 +315,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "where that is unavailable. --max-splats is lowered "
                          "(with a warning) when it would not fit.")
     _shared(parser, "image_residency")
+    parser.add_argument("--cap-order", choices=("hash", "index"), default="hash",
+                    help="which parents get their children when a densify tick asks for more "
+                         "than --max-splats leaves room for: 'hash' (default) admits a spatially "
+                         "uniform subset (by a hash of index, tick and --seed), 'index' the lowest "
+                         "indices, which after a Morton reorder cluster in one part of the scene. "
+                         "Both are deterministic.")
     parser.add_argument("--target-prefetch", type=int, default=4,
                     help="with --image-residency compressed: decode the next N sampled "
                          "training views ahead on background threads (default: 4). "

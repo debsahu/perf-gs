@@ -115,7 +115,7 @@ def test_disk_uses_shared_forward_blend(backend: str) -> None:
         primitives=primitives.storage,
         sorted_primitive_ids=sorted_ids.storage,
         pixels=pixel_buffer.storage,
-        checkpoints=checkpoints.storage,
+        checkpoints=[checkpoints.storage],
         outputs=outputs.storage,
         processed_out=processed.storage,
         primitive_count=primitive_count,

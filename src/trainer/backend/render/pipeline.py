@@ -11,7 +11,7 @@ import numpy as np
 import slangpy as spy
 
 from trainer.backend.compute.algorithms import PrefixScan, RadixSort
-from trainer.backend.compute.device import SHADERS_DIR, define_enabled
+from trainer.backend.compute.device import SHADERS_DIR, create_slang_session, define_enabled
 from trainer.backend.compute.execution import TILE_AREA, TILE_HEIGHT, TILE_WIDTH
 from trainer.backend.compute.gpu import CommandRecorder, GpuRuntime, clear_binding_cache
 from trainer.backend.compute.kernels import KernelLibrary
@@ -119,9 +119,23 @@ class TrainingPipeline:
         use_flat_bucket_backward: bool = True,
         densify_mode: DensificationMode = DensificationMode.SIMPLE,
         slang_session: spy.SlangSession | None = None,
+        checkpoint_chunk_buckets: int = buffers.CHECKPOINT_CHUNK_BUCKETS,
     ) -> None:
         self.device = device
         self.slang_session = device.slang_session if slang_session is None else slang_session
+        self.width = width
+        self.height = height
+        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only, _num_tiles(width, height))
+        # Raster checkpoints past one 4 GiB buffer are split into chunks, a layout compiled into the raster
+        # shaders: such a pipeline compiles in its own session with the chunk defines. One chunk (always the case for
+        # the viewer, whose checkpoints are a stub) keeps the given session, so its shaders are unchanged.
+        # ``checkpoint_chunk_buckets`` below the 4 GiB default forces small chunks (tests).
+        self.checkpoint_chunk_buckets = int(checkpoint_chunk_buckets)
+        chunk_defines = {} if viewer_only else buffers.checkpoint_defines(
+            self.max_sort_pairs, _num_tiles(width, height), self.checkpoint_chunk_buckets)
+        if chunk_defines:
+            own = self.slang_session.desc.compiler_options.defines or {}
+            self.slang_session = create_slang_session(device, {**own, **chunk_defines})
         self.gpu_lock = gpu_lock if gpu_lock is not None else contextlib.nullcontext()
         self.runtime = GpuRuntime(device, self.gpu_lock)
         self.commands = CommandRecorder(self.runtime)
@@ -140,10 +154,7 @@ class TrainingPipeline:
                 and stbn_config.pixel_fraction < 1.0):
             raise RuntimeError("depth/normal losses are not supported with STBN (pixel fraction < 1): their seeds "
                                "carry no STBN unbiasing scale, and their gradient needs every pixel's neighbours")
-        self.width = width
-        self.height = height
         self.max_splats = max_splats
-        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only, _num_tiles(width, height))
         self.viewer_only = viewer_only
         self.shared_data_module = _module_for_reflection(device, self.slang_session)
 
@@ -187,6 +198,7 @@ class TrainingPipeline:
                      max_sort_pairs=self.max_sort_pairs, sh_rest_floats=self._sh_rest_floats)
         if not self.viewer_only:
             sizes["structure_aware"] = self._structure_aware
+            sizes["chunk_buckets"] = self.checkpoint_chunk_buckets
         return sizes
 
     def _allocate(self) -> buffers.GaussianBuffers:

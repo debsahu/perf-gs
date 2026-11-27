@@ -24,7 +24,7 @@ def _resource_bytes(resource: Any) -> int:
 def allocated_bytes(resources: Any) -> dict[str, int]:
     """Device bytes slangpy reports per field of a dataclass tree of GPU resources.
 
-    Portable (any backend, any OS); a dict field is summed into one entry.
+    Portable (any backend, any OS); a dict or list field (the raster checkpoint chunks) is summed into one entry.
     """
     sizes: dict[str, int] = {}
 
@@ -33,8 +33,12 @@ def allocated_bytes(resources: Any) -> dict[str, int]:
             for field in dataclasses.fields(node):
                 walk(getattr(node, field.name), f"{name}.{field.name}" if name else field.name)
             return
-        size = (sum(map(_resource_bytes, node.values())) if isinstance(node, dict)
-                else _resource_bytes(node))
+        if isinstance(node, dict):
+            size = sum(map(_resource_bytes, node.values()))
+        elif isinstance(node, list):
+            size = sum(map(_resource_bytes, node))
+        else:
+            size = _resource_bytes(node)
         if size:
             sizes[name] = size
 

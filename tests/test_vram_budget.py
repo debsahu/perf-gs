@@ -309,7 +309,7 @@ def test_viewer_writes_no_raster_checkpoints_and_renders_the_same(device) -> Non
         p.render(camera)
         images.append(p.read_output_image().copy())
         if viewer:
-            assert p.buffers.raster.raster_checkpoints.storage.size == 8
+            assert [c.storage.size for c in p.buffers.raster.raster_checkpoints] == [8]
     assert images[0][..., 3].max() > 0.2 and np.array_equal(images[0], images[1])
     assert flags == [1, 0]
 
@@ -323,7 +323,7 @@ def test_viewer_forward_never_writes_its_checkpoint_stub(device) -> None:
     p.set_gaussians(means=np.array([[0.0, 0.0, 2.0]], np.float32), log_scales=np.log(np.full((1, 3), 3.0, np.float32)),
                     rot_quats=np.array([[1, 0, 0, 0]], np.float32), opacities=np.array([0.5], np.float32),
                     color_logits=np.zeros((1, 3), np.float32))
-    stub = p.buffers.raster.raster_checkpoints
+    (stub,) = p.buffers.raster.raster_checkpoints        # the viewer never splits: one stub
     sentinel = np.array([[0xDEADBEEF, 0xCAFEF00D]], np.uint32)
     stub.storage.copy_from_numpy(sentinel)
     p.render(camera)

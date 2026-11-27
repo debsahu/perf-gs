@@ -570,7 +570,7 @@ def test_forward_with_geometry_is_bit_identical_to_without():
         _forward(p, cam)
         r = p.buffers.raster
         outputs.append((r.output_image.to_numpy().copy(), r.gaussian_count_per_pixel.to_numpy().copy(),
-                        r.raster_checkpoints.to_numpy().copy()))
+                        np.concatenate([c.to_numpy().reshape(-1) for c in r.raster_checkpoints])))
     (a_img, a_cnt, a_cp), (b_img, b_cnt, b_cp) = outputs
     assert a_img[..., 3].max() > 0.1 and a_cnt.max() > 0
     assert np.array_equal(a_img, b_img) and np.array_equal(a_cnt, b_cnt) and np.array_equal(a_cp, b_cp)

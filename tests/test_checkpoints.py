@@ -118,7 +118,7 @@ def test_forward_checkpoints_reconstruct(backend: str) -> None:
     gstride = gf.size // pipeline.max_splats
     gf = gf.reshape(pipeline.max_splats, gstride)
 
-    ckpt = b.raster.raster_checkpoints.to_numpy()
+    ckpt = np.concatenate([chunk.to_numpy().reshape(-1) for chunk in b.raster.raster_checkpoints])
     ckpt_u = np.frombuffer(ckpt.tobytes(), dtype=np.uint32).reshape(-1, 2)
 
     # Final transmittance is no longer stored in a dedicated texture; the

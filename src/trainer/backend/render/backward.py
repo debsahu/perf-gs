@@ -135,7 +135,7 @@ class RasterBackward:
             tile_end=r.tile_end.storage,
             sorted_gaussian_ids=self._rasterizer.sorted_values.storage,
             bucket_offsets=r.bucket_offsets.storage,
-            raster_checkpoints=r.raster_checkpoints.storage,
+            raster_checkpoints=[chunk.storage for chunk in r.raster_checkpoints],
             camera=self._rasterizer.camera_buffer,
             output_image=r.output_image,
             gaussian_count_per_pixel=r.gaussian_count_per_pixel,

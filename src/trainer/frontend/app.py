@@ -20,7 +20,7 @@ from trainer.backend.compute.device import dispatch_groups_x
 from trainer.backend.densify.removal import accumulate_removal_cost, prune_by_removal_cost
 from trainer.backend.densify.structure_tensor import StructureTensor
 from trainer.backend.memory.budget import GIB, available_bytes, fit_capacity
-from trainer.backend.memory.buffers import frame_tiles, max_sort_pairs_limit
+from trainer.backend.memory.buffers import frame_tiles, sort_pairs_ceiling
 from trainer.backend.platform.dxgi import query_video_memory
 from trainer.backend.render.pipeline import (
     TrainingPipeline,
@@ -205,9 +205,12 @@ class TrainingApplication:
         """Load the scene and resolve what depends on it; not the device, pipeline or viewer."""
         self.args.scene = str(scene_dir)
         def validate(n_cams: int, train: list[int], test: list[int], width: int, height: int) -> None:
-            limit = max_sort_pairs_limit(dispatch_groups_x(getattr(self, "device", None)), frame_tiles(width, height))
+            device = getattr(self, "device", None)
+            memory = None if device is None else available_bytes(
+                float(getattr(self.args, "vram_budget_gib", 0.0) or 0.0), device.info.adapter_name)
+            limit, bound = sort_pairs_ceiling(dispatch_groups_x(device), frame_tiles(width, height), memory)
             validate_training_config(self.args, n_cams=n_cams, n_train=len(train), n_test=len(test),
-                                     max_sort_pairs_limit=limit)
+                                     max_sort_pairs_limit=limit, max_sort_pairs_bound=bound)
 
         self.scene_context = scene = load_scene_context(self.args, prepared, validate=validate)
         self.config = RunConfig.from_args(self.args, scene.extent)

@@ -161,7 +161,7 @@ void backwardRasterizePerSplat(
     StructuredBuffer<uint> tile_end,
     StructuredBuffer<uint> sorted_gaussian_ids,
     StructuredBuffer<uint> bucket_offsets,
-    StructuredBuffer<uint2> raster_checkpoints,
+    StructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     StructuredBuffer<CameraData> camera,
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
@@ -342,17 +342,16 @@ void backwardRasterizePerSplat(
         GroupMemoryBarrierWithGroupSync();
         if (bucket_valid)
         {
-            uint cp_base = checkpointIndex(cp_bucket, 0u);
 #if STBN_ENABLED
             // Slot k holds the k-th sampled pixel's checkpoint, indexed by visit slot below.
             for (uint k = lane; k < visit_count; k += RASTER_BUCKET_SIZE)
                 gs_checkpoints[warp_idx][k] =
-                    raster_checkpoints[cp_base + gs_stbn_visit[0][k]];
+                    loadCheckpoint(raster_checkpoints, cp_bucket, gs_stbn_visit[0][k]);
 #else
             uint phase = pixel_phase % BACKWARD_PIXEL_STRIDE;  // 0 at STRIDE=1
             // Slot k holds pixel p = phase + k * STRIDE, exactly the pixels the loop visits.
             for (uint k = lane; k < STAGED_PIXELS; k += RASTER_BUCKET_SIZE)
-                gs_checkpoints[warp_idx][k] = raster_checkpoints[cp_base + phase + k * BACKWARD_PIXEL_STRIDE];
+                gs_checkpoints[warp_idx][k] = loadCheckpoint(raster_checkpoints, cp_bucket, phase + k * BACKWARD_PIXEL_STRIDE);
 #endif
         }
         GroupMemoryBarrierWithGroupSync();
@@ -561,7 +560,7 @@ void backwardRasterizePerBucket(
     StructuredBuffer<uint> bucket_offsets,
     StructuredBuffer<uint2> live_buckets,        // (tile, local_bucket) per slot
     StructuredBuffer<uint> live_bucket_total,    // [1]: number of live buckets
-    StructuredBuffer<uint2> raster_checkpoints,
+    StructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     StructuredBuffer<CameraData> camera,
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
@@ -650,21 +649,19 @@ void backwardRasterizePerBucket(
         visit_count = stbnActive(stbn_tile_pixels)
             ? min(stbnTileCount(stbn_table, stbn_base), STBN_VISIT_CAPACITY)
             : TILE_AREA;
-        uint cp_base = checkpointIndex(cp_bucket, 0u);
         for (uint k = lane; k < visit_count; k += RASTER_BUCKET_SIZE)
         {
             uint p = stbnPixelAtSlot(stbn_table, stbn_base, k);
             gs_stbn_visit[warp_idx][k] = p;
-            gs_checkpoints[warp_idx][k] = raster_checkpoints[cp_base + p];
+            gs_checkpoints[warp_idx][k] = loadCheckpoint(raster_checkpoints, cp_bucket, p);
         }
     }
 #else
     uint visit_count = TILE_AREA;
     if (bucket_valid)
     {
-        uint cp_base = checkpointIndex(cp_bucket, 0u);
         for (uint k = lane; k < STAGED_PIXELS; k += RASTER_BUCKET_SIZE)
-            gs_checkpoints[warp_idx][k] = raster_checkpoints[cp_base + phase + k * BACKWARD_PIXEL_STRIDE];
+            gs_checkpoints[warp_idx][k] = loadCheckpoint(raster_checkpoints, cp_bucket, phase + k * BACKWARD_PIXEL_STRIDE);
     }
 #endif
     // RAW: the pixel loop reads checkpoints staged by other lanes; every warp must arrive first.

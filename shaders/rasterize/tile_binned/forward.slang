@@ -28,7 +28,7 @@ void forwardRasterize(
     StructuredBuffer<CameraData> camera,
     // Ragged (CSR) (T, C_in_front) checkpoints, one per RASTER_BUCKET_SIZE splats, for the per-splat backward.
     StructuredBuffer<uint> bucket_offsets,
-    RWStructuredBuffer<uint2> raster_checkpoints,
+    RWStructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
 #if GEOM_PRIORS

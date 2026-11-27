@@ -21,10 +21,12 @@ class ConfigError(ValueError):
 # The frontend passes the device's own ceiling (trainer.backend.memory.buffers.max_sort_pairs_limit); this layer
 # imports no backend module, so the default is a literal that tests/test_sort_dispatch_limit.py pins to the backend's.
 SPEC_MAX_SORT_PAIRS = 65_535 * 2_048
+SPEC_MAX_SORT_PAIRS_BOUND = "the radix sort's dispatch width of 65,535 groups (the Vulkan-spec minimum)"
 
 
 def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: int,
-                             n_test: int, max_sort_pairs_limit: int = SPEC_MAX_SORT_PAIRS) -> None:
+                             n_test: int, max_sort_pairs_limit: int = SPEC_MAX_SORT_PAIRS,
+                             max_sort_pairs_bound: str = SPEC_MAX_SORT_PAIRS_BOUND) -> None:
     """Reject combinations that would crash mid-run or silently do nothing.
 
     Runs once the scene and holdout split are known; the CLI defaults always pass.
@@ -49,11 +51,12 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
     # A window past the training views is clamped to them by the loop (the defaults always pass).
     if not 0.0 < args.final_splat_fraction <= 1.0:
         raise ConfigError("--final-splat-fraction must be in (0, 1].")
-    # The radix sort dispatches one group per 2,048 keys along a single GPU dimension (65,535 groups is the
-    # Vulkan-spec minimum), and the raster checkpoints must fit one storage buffer: the caller passes the ceiling
-    # for its device and frame size when it knows them.
+    # The sort capacity is bounded by the radix sort's dispatch width, its 4 GiB key arrays, the raster checkpoint
+    # chunks, and the device memory when known: the caller passes the ceiling for its device and frame size, and the
+    # bound that sets it (trainer.backend.memory.buffers.sort_pairs_ceiling).
     if args.max_sort_pairs is not None and not 1 <= args.max_sort_pairs <= max_sort_pairs_limit:
-        raise ConfigError(f"--max-sort-pairs must be between 1 and {max_sort_pairs_limit:,}.")
+        raise ConfigError(f"--max-sort-pairs must be between 1 and {max_sort_pairs_limit:,}, got "
+                          f"{args.max_sort_pairs:,}: the ceiling is set by {max_sort_pairs_bound}.")
 
     # densify_every is a modulo divisor of the schedule, not a "disable" value.
     if args.densify_every < 1:

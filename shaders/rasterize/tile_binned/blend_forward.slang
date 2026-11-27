@@ -26,7 +26,7 @@ void blendForwardImpl<S : IPrimitiveSource, let N : int>(
     uint pixel_in_tile[N],
     uint tile_bucket_base,
     StructuredBuffer<uint> sorted_primitive_ids,
-    RWStructuredBuffer<uint2> raster_checkpoints,
+    RWStructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     float extinction_hardness,
     out float3 color[N],
     out float transmittance[N],
@@ -60,8 +60,8 @@ void blendForwardImpl<S : IPrimitiveSource, let N : int>(
             if (!active[j])
                 continue;
             if (bucket_start && write_checkpoints)
-                raster_checkpoints[checkpointIndex(bucket, pixel_in_tile[j])] =
-                    packCheckpoint(transmittance[j], color[j]);
+                storeCheckpoint(raster_checkpoints, bucket, pixel_in_tile[j],
+                    packCheckpoint(transmittance[j], color[j]));
 
             float alpha = min(primitive.coverage(pixel_center[j]), BLEND_ALPHA_MAX);
             if (alpha >= BLEND_ALPHA_MIN)
@@ -88,7 +88,7 @@ void blendForward<S : IPrimitiveSource, let N : int>(
     uint pixel_in_tile[N],
     uint tile_bucket_base,
     StructuredBuffer<uint> sorted_primitive_ids,
-    RWStructuredBuffer<uint2> raster_checkpoints,
+    RWStructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     float extinction_hardness,
     out float3 color[N],
     out float transmittance[N],
@@ -113,7 +113,7 @@ void blendForwardAux<S : IPrimitiveSource, let N : int>(
     uint pixel_in_tile[N],
     uint tile_bucket_base,
     StructuredBuffer<uint> sorted_primitive_ids,
-    RWStructuredBuffer<uint2> raster_checkpoints,
+    RWStructuredBuffer<uint2> raster_checkpoints[CHECKPOINT_CHUNKS],
     float extinction_hardness,
     StructuredBuffer<float4> geom_data,
     out float3 color[N],
@@ -151,8 +151,8 @@ void blendForwardAux<S : IPrimitiveSource, let N : int>(
             if (!active[j])
                 continue;
             if (bucket_start && write_checkpoints)
-                raster_checkpoints[checkpointIndex(bucket, pixel_in_tile[j])] =
-                    packCheckpoint(transmittance[j], color[j]);
+                storeCheckpoint(raster_checkpoints, bucket, pixel_in_tile[j],
+                    packCheckpoint(transmittance[j], color[j]));
 
             float alpha = min(primitive.coverage(pixel_center[j]), BLEND_ALPHA_MAX);
             if (alpha >= BLEND_ALPHA_MIN)

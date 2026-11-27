@@ -45,4 +45,43 @@ uint checkpointIndex(uint global_bucket, uint pixel_in_tile)
     return global_bucket * CHECKPOINT_TILE_AREA + pixel_in_tile;
 }
 
+// The checkpoints are split into CHECKPOINT_CHUNKS buffers of CHECKPOINT_CHUNK_BUCKETS buckets each, so the
+// total can pass the 4 GiB a single storage buffer may address. Chunk c holds global buckets
+// [c * CHECKPOINT_CHUNK_BUCKETS, (c + 1) * CHECKPOINT_CHUNK_BUCKETS). A bucket's TILE_AREA entries never
+// straddle two chunks; a tile's buckets may. Both values must match buffers.py (checkpoint_chunk_layout).
+#ifndef CHECKPOINT_CHUNKS
+#define CHECKPOINT_CHUNKS 1
+#endif
+#ifndef CHECKPOINT_CHUNK_BUCKETS
+#define CHECKPOINT_CHUNK_BUCKETS 8388607u   // (2^32 - 1) / (TILE_AREA * 8 bytes): one chunk within 4 GiB
+#endif
+
+// Store / load one checkpoint entry by global bucket. With one chunk this is the single-buffer index.
+// Buckets of one workgroup may sit in different chunks, so the chunk index is marked non-uniform.
+void storeCheckpoint(RWStructuredBuffer<uint2> chunks[CHECKPOINT_CHUNKS], uint global_bucket,
+                     uint pixel_in_tile, uint2 entry)
+{
+#if CHECKPOINT_CHUNKS == 1
+    chunks[0][checkpointIndex(global_bucket, pixel_in_tile)] = entry;
+#else
+    uint chunk = global_bucket / CHECKPOINT_CHUNK_BUCKETS;
+    if (chunk < CHECKPOINT_CHUNKS)
+        chunks[NonUniformResourceIndex(chunk)][
+            checkpointIndex(global_bucket - chunk * CHECKPOINT_CHUNK_BUCKETS, pixel_in_tile)] = entry;
+#endif
+}
+
+uint2 loadCheckpoint(StructuredBuffer<uint2> chunks[CHECKPOINT_CHUNKS], uint global_bucket, uint pixel_in_tile)
+{
+#if CHECKPOINT_CHUNKS == 1
+    return chunks[0][checkpointIndex(global_bucket, pixel_in_tile)];
+#else
+    uint chunk = global_bucket / CHECKPOINT_CHUNK_BUCKETS;
+    if (chunk >= CHECKPOINT_CHUNKS)
+        return uint2(0u, 0u);
+    return chunks[NonUniformResourceIndex(chunk)][
+        checkpointIndex(global_bucket - chunk * CHECKPOINT_CHUNK_BUCKETS, pixel_in_tile)];
+#endif
+}
+
 #endif // TRAINER_RASTER_CHECKPOINT_SLANG

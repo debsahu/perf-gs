@@ -14,7 +14,7 @@ void diskForward(
     StructuredBuffer<Disk2D> primitives,
     StructuredBuffer<uint> sorted_primitive_ids,
     StructuredBuffer<float2> pixels,
-    RWStructuredBuffer<uint2> checkpoints,
+    RWStructuredBuffer<uint2> checkpoints[CHECKPOINT_CHUNKS],
     RWStructuredBuffer<float4> outputs,
     RWStructuredBuffer<uint> processed_out,
     uniform uint primitive_count,

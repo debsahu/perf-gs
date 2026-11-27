@@ -10,10 +10,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from trainer.backend.compute.execution import RADIX_PART_SIZE
 from trainer.backend.compute.device import dispatch_groups_x
+from trainer.backend.compute.execution import RADIX_PART_SIZE
 from trainer.backend.memory.buffers import max_sort_pairs_limit
-from trainer.config.validation import SPEC_MAX_SORT_PAIRS, ConfigError, validate_training_config
+from trainer.config.validation import (
+    SPEC_MAX_SORT_PAIRS,
+    ConfigError,
+    validate_training_config,
+)
 from trainer.frontend.cli import build_parser
 
 OLD_CEILING = 65_535 * 2_048          # 134,215,680
@@ -65,6 +69,7 @@ def test_app_validates_against_its_device(gpu_device, tmp_path, monkeypatch) -> 
     """_prepare_scene must pass the real device's X limit: a capacity above the old ceiling loads on a device that
     allows it and is refused when the same device reports the spec minimum."""
     from _colmap_testkit import write_colmap_scene
+
     from trainer.frontend.app import TrainingApplication
     if dispatch_groups_x(gpu_device) < 2 * 65_535:
         pytest.skip("device reports the spec-minimum dispatch width")
@@ -101,10 +106,9 @@ def test_radix_sort_beyond_65535_groups(radix_kernels) -> None:
 
 from test_radix_sort import radix_kernels  # noqa: E402,F401  (module fixture reused)
 
-
 # raster_checkpoints is the largest buffer that grows with --max-sort-pairs: one uint2 per tile pixel per bucket,
-# (ceil(pairs / RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA * 8 bytes, about 16 bytes per pair. It must stay inside a
-# 4 GiB - 1 storage-buffer range too, which bounds the pairs ~4x tighter than the 4-byte pair arrays do.
+# (ceil(pairs / RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA * 8 bytes, about 16 bytes per pair. It is split into
+# chunks of at most 4 GiB - 1 each (test_checkpoint_chunks.py), so it no longer bounds the ceiling by itself.
 RANGE = 2**32 - 1
 
 
@@ -113,34 +117,44 @@ def _checkpoint_bytes(pairs: int, num_tiles: int) -> int:
     return (-(-pairs // RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA * 8
 
 
-def test_ceiling_keeps_raster_checkpoints_inside_a_4gib_buffer() -> None:
+def test_ceiling_splits_raster_checkpoints_into_4gib_chunks() -> None:
+    from trainer.backend.memory.buffers import checkpoint_chunk_buckets
     cap = max_sort_pairs_limit(1 << 31)
-    assert 0 < _checkpoint_bytes(cap, 0) <= RANGE, cap
-    # tight: one more radix part would not fit, so the bound is the checkpoint buffer and not something smaller
-    assert _checkpoint_bytes(cap + RADIX_PART_SIZE, 0) > RANGE
+    assert _checkpoint_bytes(cap, 0) > RANGE                    # past one buffer: the checkpoints split
+    assert all(n * 64 * 8 <= RANGE for n in checkpoint_chunk_buckets(cap, 0))
     assert cap > OLD_CEILING                                    # the device limit still lifts the old ceiling
 
 
-@pytest.mark.parametrize("num_tiles", [1, 4_096, 750_000])
+@pytest.mark.parametrize("num_tiles", [1, 4_096, 750_000, 9_000_000])
 def test_ceiling_counts_the_frame_tiles(num_tiles: int) -> None:
+    """Every checkpoint chunk of the ceiling fits 4 GiB; at 9M tiles the chunk count is what binds, one radix part
+    past it is refused by the allocator, and the validator refuses the ceiling plus one."""
+    from trainer.backend.memory.buffers import (
+        MAX_CHECKPOINT_CHUNKS,
+        checkpoint_chunk_buckets,
+    )
     cap = max_sort_pairs_limit(1 << 31, num_tiles=num_tiles)
-    assert _checkpoint_bytes(cap, num_tiles) <= RANGE < _checkpoint_bytes(cap + RADIX_PART_SIZE, num_tiles)
+    chunks = checkpoint_chunk_buckets(cap, num_tiles)
+    assert all(n * 64 * 8 <= RANGE for n in chunks) and len(chunks) <= MAX_CHECKPOINT_CHUNKS
+    if num_tiles == 9_000_000:
+        with pytest.raises(ValueError, match="raster checkpoint chunks"):
+            checkpoint_chunk_buckets(cap + RADIX_PART_SIZE, num_tiles)
     with pytest.raises(ConfigError, match="max-sort-pairs"):
         validate_training_config(_args(cap + 1), n_cams=8, n_train=8, n_test=1, max_sort_pairs_limit=cap)
 
 
-def test_allocation_refuses_checkpoints_past_4gib(gpu_device) -> None:
-    """The allocator itself refuses an oversized checkpoint buffer, for callers that skip validation (viewer, API)."""
+def test_allocation_splits_checkpoints_past_4gib(gpu_device) -> None:
+    """402,653,184 pairs, refused as one 6.0 GiB buffer before the split, now allocate as chunks: the estimate counts
+    every chunk, and the viewer still binds a one-element stub."""
     from trainer.backend.memory.buffers import estimate_allocation_bytes
     from trainer.backend.render.pipeline import TrainingPipeline
     module = TrainingPipeline(gpu_device, 16, 16, max_splats=16).shared_data_module
     sizes = dict(max_splats=16, width=16, height=16, sh_rest_floats=0)
-    fits = max_sort_pairs_limit(1 << 31, num_tiles=4)
-    assert estimate_allocation_bytes(module, max_sort_pairs=fits, **sizes) > _checkpoint_bytes(fits, 4)
-    with pytest.raises(ValueError, match="raster_checkpoints"):
-        estimate_allocation_bytes(module, max_sort_pairs=402_653_184, **sizes)
-    # the viewer binds a one-element checkpoint stub, so its sort capacity is bounded by the pair arrays only
-    estimate_allocation_bytes(module, viewer_only=True, max_sort_pairs=402_653_184, **sizes)
+    pairs = 402_653_184
+    total = estimate_allocation_bytes(module, max_sort_pairs=pairs, **sizes)
+    assert _checkpoint_bytes(pairs, 4) > RANGE
+    assert total > _checkpoint_bytes(pairs, 4) + 6 * 4 * pairs
+    estimate_allocation_bytes(module, viewer_only=True, max_sort_pairs=pairs, **sizes)
 
 
 def test_default_sort_pairs_stay_inside_the_checkpoint_range() -> None:
@@ -184,18 +198,19 @@ def test_the_device_allocator_refuses_a_buffer_past_4gib(monkeypatch) -> None:
 
 
 def test_app_ceiling_counts_the_scene_frame_tiles(tmp_path, monkeypatch) -> None:
-    """At 128 x 128 (256 tiles) the ceiling is 8,192 pairs under the tile-less one: a capacity between the two must be
-    refused, which it is only if _prepare_scene passes the frame's tiles."""
+    """_prepare_scene passes the frame's tiles: on a device whose dispatch width allows it, the checkpoint chunks
+    bind at a huge frame only, so the tiles are checked through the ceiling's arguments
+    (test_checkpoint_chunks.test_app_passes_frame_tiles_and_device_budget) and here through a refusal: one radix
+    part past the framed ceiling is refused."""
     from _colmap_testkit import write_colmap_scene
+
     from trainer.backend.memory.buffers import frame_tiles
     from trainer.frontend.app import TrainingApplication
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("trainer.frontend.app.dispatch_groups_x", lambda _device: 1 << 30)
     scene = write_colmap_scene(tmp_path / "scene", views=[(f"{i}.png", 128, 128, 100.0) for i in range(2)])
-    tileless = max_sort_pairs_limit(1 << 30, num_tiles=0)
     framed = max_sort_pairs_limit(1 << 30, num_tiles=frame_tiles(128, 128))
-    assert framed < tileless
-    args = build_parser().parse_args(["--scene", str(scene), "--no-viewer", "--max-sort-pairs", str(tileless),
+    args = build_parser().parse_args(["--scene", str(scene), "--no-viewer", "--max-sort-pairs", str(framed + 1),
                                       "--width", "128", "--height", "128", "--no-write-ground-truths",
                                       "--no-stereo-init"])
     with pytest.raises(ConfigError, match="max-sort-pairs"):

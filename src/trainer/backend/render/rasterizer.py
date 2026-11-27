@@ -242,7 +242,7 @@ class Rasterizer:
                 sorted_gaussian_ids=sorted_values.storage,
                 camera=self.camera_buffer,
                 bucket_offsets=r.bucket_offsets.storage,
-                raster_checkpoints=r.raster_checkpoints.storage,
+                raster_checkpoints=[chunk.storage for chunk in r.raster_checkpoints],
                 write_checkpoints=int(self.write_checkpoints),
                 output_image=r.output_image,
                 gaussian_count_per_pixel=r.gaussian_count_per_pixel,

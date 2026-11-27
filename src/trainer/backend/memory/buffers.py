@@ -374,9 +374,9 @@ def _element_stride(dtype) -> int:
     return _SCALAR_STRIDES[dtype] if isinstance(dtype, str) else int(dtype.buffer_layout.reflection.stride)
 
 
-def _check_storage_range(label: str, size: int) -> None:
+def check_storage_range(label: str, size: int) -> None:
     """Refuse a storage buffer past one storage-buffer range: a shader index past 4 GiB - 1 wraps silently (NVIDIA)."""
-    if size > STORAGE_BUFFER_RANGE:
+    if size > STORAGE_BUFFER_RANGE:   # read at call time (tests lower it)
         raise ValueError(f"buffer {label!r} needs {size / 2**30:.2f} GiB, past the 4 GiB storage-buffer range; "
                          "lower --max-splats (or the SH degree / sort capacity that sizes it)")
 
@@ -389,7 +389,7 @@ class _Alloc:
     height: int
 
     def typed_buffer(self, label: str, dtype, *shape) -> spy.NDBuffer:
-        _check_storage_range(label, int(np.prod(shape)) * _element_stride(dtype))
+        check_storage_range(label, int(np.prod(shape)) * _element_stride(dtype))
         return _make_labeled_ndbuffer(
             self.device, dtype, shape, label, _DEFAULT_BUFFER_USAGE)
 
@@ -731,7 +731,7 @@ class _AllocationCounter:
     def typed_buffer(self, label, dtype, *shape):
         from types import SimpleNamespace
         size = int(np.prod(shape)) * _element_stride(dtype)
-        _check_storage_range(label, size)
+        check_storage_range(label, size)
         self.total += size
         return SimpleNamespace(storage=SimpleNamespace(size=size),
                                copy_from_numpy=lambda _data: None)

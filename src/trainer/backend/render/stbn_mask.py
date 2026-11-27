@@ -33,6 +33,8 @@ class StbnMask:
             raise ValueError(
                 f"packed table must be uint32[{spec.voxels}], got "
                 f"{packed.dtype}{packed.shape}")
+        from trainer.backend.memory.buffers import check_storage_range
+        check_storage_range(label, packed.nbytes)
         buffer = device.create_buffer(size=packed.nbytes, usage=_USAGE, label=label)
         buffer.copy_from_numpy(np.ascontiguousarray(packed).view(np.uint8))
         return cls(table=buffer, dims=(spec.width, spec.height), slices=spec.slices)

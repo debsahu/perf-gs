@@ -46,6 +46,8 @@ class MipFilter:
             # proj[0][0] = 2 fx / W
             fx = abs(float(camera.proj_matrix[0, 0])) * float(camera.image_size[0]) * 0.5
             max_focal = max(max_focal, fx)
+        from trainer.backend.memory.buffers import check_storage_range
+        check_storage_range("mip_cameras", data.nbytes)
         buffer = self._device.create_buffer(
             size=data.nbytes,
             usage=spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access,

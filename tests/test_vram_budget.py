@@ -237,3 +237,34 @@ def test_viewer_writes_no_raster_checkpoints_and_renders_the_same(device) -> Non
             assert p.buffers.raster.raster_checkpoints.storage.size == 8
     assert images[0][..., 3].max() > 0.2 and np.array_equal(images[0], images[1])
     assert flags == [1, 0]
+
+
+def test_viewer_forward_never_writes_its_checkpoint_stub(device) -> None:
+    """The shader gate itself: a frame-covering render reaches bucket 0 of tile 0, pixel 0, which is checkpoint
+    index 0, the stub's only element. With the write gate in blend_forward.slang the sentinel survives; without it
+    the viewer writes there (and on Metal past the stub)."""
+    camera = simple_camera(width=32, height=24, eye=(0.0, 0.0, 0.0), target=(0.0, 0.0, 1.0), fovy_degrees=60.0)
+    p = TrainingPipeline(device, 32, 24, max_splats=64, viewer_only=True)
+    p.set_gaussians(means=np.array([[0.0, 0.0, 2.0]], np.float32), log_scales=np.log(np.full((1, 3), 3.0, np.float32)),
+                    rot_quats=np.array([[1, 0, 0, 0]], np.float32), opacities=np.array([0.5], np.float32),
+                    color_logits=np.zeros((1, 3), np.float32))
+    stub = p.buffers.raster.raster_checkpoints
+    sentinel = np.array([[0xDEADBEEF, 0xCAFEF00D]], np.uint32)
+    stub.storage.copy_from_numpy(sentinel)
+    p.render(camera)
+    image = p.read_output_image()
+    assert image[0, 0, 3] > 0.05                         # pixel 0 of tile 0 is covered: bucket 0 is written there
+    np.testing.assert_array_equal(stub.storage.to_numpy().view(np.uint32).reshape(1, 2), sentinel)
+
+
+def test_small_device_buffers_pass_the_storage_range_guard(device, monkeypatch) -> None:
+    """The mip-filter cameras and the STBN table are created outside the allocator; they take the same guard."""
+    from trainer.backend.memory import buffers
+    from trainer.backend.render.stbn_mask import StbnMask
+    p = TrainingPipeline(device, 16, 16, max_splats=16)
+    monkeypatch.setattr(buffers, "STORAGE_BUFFER_RANGE", 16)
+    with pytest.raises(ValueError, match="mip_cameras"):
+        p.mip_filter.set_cameras([simple_camera(width=16, height=16, eye=(0.0, 0.0, 0.0))])
+    spec = type("Spec", (), {"voxels": 8, "width": 2, "height": 2, "slices": 2})()
+    with pytest.raises(ValueError, match="stbn_table"):
+        StbnMask.from_table(device, np.zeros(8, np.uint32), spec)

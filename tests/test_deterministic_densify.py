@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import slangpy as spy
 
+from test_radix_sort import _radix_sort, radix_kernels  # noqa: F401  (fixture)
 from test_structure_densify import _count, _read_gaussians, _setup
 from trainer.config.config import DensifyConfig, StructureConfig
 
@@ -122,21 +123,75 @@ def test_reference_discriminates_order(gpu_device) -> None:
     assert not np.allclose(swapped, want, atol=2e-5)
 
 
-def test_ranked_cutoff_admits_lowest_indices(gpu_device) -> None:
-    """Six identical parents in one priority bin, room for three children: parents 0, 1, 2 split."""
-    n, room = 6, 3
+def _one_axis(p) -> None:
+    for axis in ("max_y", "max_z"):                     # each family then costs one child
+        p.buffers.eta.components[axis].copy_from_numpy(np.zeros(p.max_splats, np.uint32))
+
+
+@pytest.mark.parametrize("n,room", [(6000, 3000), (20000, 7001)])
+def test_ranked_cutoff_admits_lowest_indices(gpu_device, n, room) -> None:
+    """n identical parents in one priority bin over many workgroups, room for `room` children:
+    exactly parents 0..room-1 split, in that order, and the rest keep their parent."""
     p = _setup(gpu_device, max_splats=n + room)
     parents = _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
-    b = p.buffers                                       # one axis only: each family costs one child
-    for axis in ("max_y", "max_z"):
-        b.eta.components[axis].copy_from_numpy(np.zeros(p.max_splats, np.uint32))
+    _one_axis(p)
     _densify_structure(p, rank_split_families=True)
-    actions = _u32(b.densification.actions, n)
-    assert actions.tolist() == [1, 1, 1, 0, 0, 0]
+    actions = _u32(p.buffers.densification.actions, n)
+    assert (actions[:room] == 1).all() and (actions[room:] == 0).all(), \
+        (int((actions == 1).sum()), np.flatnonzero(actions[:room] != 1)[:5], np.flatnonzero(actions[room:] == 1)[:5])
     assert _count(p) == n + room
     owners = np.rint(_read_gaussians(p, n + room)[n:, 0] / SPACING).astype(int)
-    assert owners.tolist() == [0, 1, 2]
-    np.testing.assert_array_equal(_read_gaussians(p, n)[3:], parents[3:])
+    np.testing.assert_array_equal(owners, np.arange(room))
+    np.testing.assert_array_equal(_read_gaussians(p, n)[room:], parents[room:])
+
+
+def test_ranked_cutoff_is_all_or_nothing_per_parent(gpu_device) -> None:
+    """Six identical (2,2,1) families: level 1 costs 1 each, level 2 costs 2 each. Room for all six level-1
+    upgrades plus 3 slots: the cutoff bin is level 2 with 3 slots left, so parent 0 (0 + 2 <= 3) gets its
+    second axis, parent 1 (2 + 2 > 3) does not, nor any later parent."""
+    n = 6
+    p = _setup(gpu_device, max_splats=n + n + 3)
+    _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    p.buffers.eta.components["max_z"].copy_from_numpy(np.zeros(p.max_splats, np.uint32))
+    _densify_structure(p, rank_split_families=True)
+    f = np.stack([_u32(getattr(p.buffers.structure, f"split_factor_{a}"), n) for a in "xyz"], axis=1)
+    assert f.prod(axis=1).tolist() == [4, 2, 2, 2, 2, 2], f.tolist()
+
+
+def _trigger(p, mask) -> None:
+    """Retrigger exactly the splats in mask (one-axis eta 1.5), clearing every other accumulator."""
+    cap, n = p.max_splats, len(mask)
+
+    def full(values, dtype=np.uint32):
+        a = np.zeros(cap, dtype)
+        a[:n] = values
+        return a
+    b = p.buffers
+    total = full(np.where(mask, 10, 0))
+    b.eta.n_total.copy_from_numpy(total)
+    b.eta.components["n_high"].copy_from_numpy(total)
+    b.eta.components["n_low"].copy_from_numpy(np.zeros(cap, np.uint32))
+    for axis in ("max_x", "max_y", "max_z"):
+        b.eta.components[axis].copy_from_numpy(full(np.full(n, int(1.5 * 65536), np.uint32)))
+    b.densification.visibility_count.copy_from_numpy(full(np.ones(n)))
+    b.densification.grad_mean_2d_mag.copy_from_numpy(full(np.where(mask, 65536, 0), np.int64))
+
+
+def test_ranked_second_tick_ignores_stale_cutoff_scratch(gpu_device) -> None:
+    """Tick 1 leaves nonzero offsets in the scratch the cutoff cost reuses. Tick 2 triggers parents
+    1, 3, 5, 7 with room for 3: stale entries of the non-parents must not eat the cutoff budget."""
+    n, room = 8, 3
+    p = _setup(gpu_device, max_splats=n + room)
+    _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    _one_axis(p)
+    _densify_structure(p, rank_split_families=True)
+    assert _count(p) == n + room
+    _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    _trigger(p, np.arange(n) % 2 == 1)
+    _one_axis(p)
+    _densify_structure(p, rank_split_families=True)
+    assert _u32(p.buffers.densification.actions, n).tolist() == [0, 1, 0, 1, 0, 1, 0, 0]
+    assert _count(p) == n + room
 
 
 def _simple_population(p, n, seed=0):
@@ -237,3 +292,145 @@ def test_large_population_repeats_bit_identically(gpu_device) -> None:
         hashes.add((count, values.tobytes()))
     assert len(hashes) == 1
     assert next(iter(hashes))[0] == cap                 # the cap bound, so the boundary family was cut
+
+
+def _owner_check(p, n, cap):
+    """Tail slot k must hold a child of the k-th unit of growth in parent-index order."""
+    actions = _u32(p.buffers.densification.actions, n)
+    fx, fy, fz = (_u32(getattr(p.buffers.structure, f"split_factor_{a}"), n) for a in "xyz")
+    grid = np.maximum(fx, 1).astype(np.int64) * np.maximum(fy, 1) * np.maximum(fz, 1)
+    growth = np.where(actions == 2, 1, np.where(actions == 1, grid - 1, 0))
+    total = int(growth.sum())
+    live = min(n + total, cap)
+    assert _count(p) == live, (_count(p), live)
+    owners_expected = np.repeat(np.arange(n), growth)[: live - n]
+    owners_got = np.rint(_read_gaussians(p, live)[n:live, 0] / SPACING).astype(np.int64)
+    bad = np.flatnonzero(owners_got != owners_expected)
+    assert bad.size == 0, f"{bad.size} tail slots hold another parent's child; first {bad[:5]}"
+    return total
+
+
+@pytest.mark.parametrize("cap", [3_500_000, 6_000_000], ids=["cap-binds", "roomy"])
+def test_three_level_scan_layout(gpu_device, cap) -> None:
+    """1.15M parents: the prefix sum needs three levels and parents sit past index 1,048,576."""
+    n = 1_150_000
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, n, seed=11)
+    _densify_structure(p)
+    total = _owner_check(p, n, cap)
+    assert (n + total > cap) == (cap == 3_500_000)
+
+
+@pytest.mark.parametrize("cap", [4000, 1500], ids=["roomy", "cap-full"])
+def test_sh_structure_layout_matches_reference(gpu_device, cap) -> None:
+    n = 1000
+    p = _setup(gpu_device, max_splats=cap, sh_degree=3)
+    parents = _population(p, n, seed=1)
+    _densify_structure(p)
+    actions = _u32(p.buffers.densification.actions, n)
+    factors = np.stack([_u32(getattr(p.buffers.structure, f"split_factor_{a}"), n) for a in "xyz"], axis=1)
+    want, live = _structure_reference(parents, actions, factors, cap, StructureConfig().ks_scale_power)
+    assert _count(p) == live
+    np.testing.assert_allclose(_read_gaussians(p, live), want, rtol=0, atol=2e-5)
+
+
+@pytest.mark.parametrize("cap", [2000, 1200], ids=["roomy", "cap-full"])
+def test_sh_simple_layout_matches_reference(gpu_device, cap) -> None:
+    n = 1000
+    p = _setup(gpu_device, max_splats=cap, sh_degree=3)
+    _, hot, _ = _simple_population(p, n, seed=3)
+    p.simple_densifier.run(DensifyConfig(), grad_thresh=0.0002, scale_thresh=0.05, allow_scale_prune=False)
+    expected_owner = hot[:max(0, cap - n)]
+    live = n + len(expected_owner)
+    assert _count(p) == live
+    owners = np.rint(_read_gaussians(p, live)[n:, 0] / SPACING).astype(int)
+    np.testing.assert_array_equal(owners, expected_owner)
+
+
+def test_stale_actions_past_pre_count_are_not_parents(gpu_device) -> None:
+    """Tick 1 on 1,000 triggered splats leaves split/clone actions at 300..999; tick 2 has 300 splats."""
+    cap = 6000
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, 1000, seed=21, keep_fraction=0.0)
+    _densify_structure(p)
+    stale = _u32(p.buffers.densification.actions, 1000)[300:]
+    assert ((stale == 1) | (stale == 2)).any()
+    _population(p, 300, seed=22)
+    _densify_structure(p)
+    _owner_check(p, 300, cap)
+
+
+# ---------------------------------------------------------------- overflow
+
+def test_prefix_scan_saturates_instead_of_wrapping(gpu_device) -> None:
+    """Offsets past 0xFFFFFFFF stay 0xFFFFFFFF, across a block boundary too."""
+    from trainer.backend.compute.execution import SCAN_BLOCK_SIZE
+    p = _setup(gpu_device, max_splats=4 * SCAN_BLOCK_SIZE)
+    n = 3 * SCAN_BLOCK_SIZE
+    values = np.zeros(p.max_splats, np.uint32)
+    values[0], values[1], values[5] = 0xF0000000, 0x20000000, 7
+    values[SCAN_BLOCK_SIZE + 3] = 1
+    buf = p.buffers.densification.child_offset
+    buf.copy_from_numpy(values)
+    scan = p.structure_densifier._scan
+    with p.commands.recording("scan_test"):
+        scan.scan(n, buf, buf, p.buffers.densification.post_count)
+    p.runtime.wait_for_idle()
+    out = _u32(buf, n)
+    assert out[0] == 0 and out[1] == 0xF0000000
+    assert (out[2:] == 0xFFFFFFFF).all()
+    assert _u32(p.buffers.densification.post_count)[0] == 0xFFFFFFFF
+
+
+def test_huge_split_grid_does_not_wrap(gpu_device) -> None:
+    """A 2048 x 2048 x 1024 grid is exactly 2**32 children: a wrapping product reads as a 0-child grid
+    and skips the split. Saturated, the family fills the cap."""
+    cap = 600
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, 1, seed=1, clone_fraction=0, keep_fraction=0)
+    for axis, eta in (("max_x", 2048), ("max_y", 2048), ("max_z", 1024)):
+        e = np.zeros(cap, np.uint32)
+        e[0] = eta * 65536
+        p.buffers.eta.components[axis].copy_from_numpy(e)
+    _densify_structure(p, max_split_factor=2048, split_power=1.0)
+    factors = [int(_u32(getattr(p.buffers.structure, f"split_factor_{a}"), 1)[0]) for a in "xyz"]
+    assert factors == [2048, 2048, 1024]
+    assert _count(p) == cap
+    assert np.isfinite(_read_gaussians(p, cap)).all()
+
+
+def test_tail_offset_past_the_cap_writes_nothing(gpu_device, monkeypatch) -> None:
+    """A parent whose offset is near 0xFFFFFFFF must not wrap pre_count + offset onto a live slot."""
+    n, cap = 200, 4000
+    p = _setup(gpu_device, max_splats=cap)
+    parents = _population(p, n, seed=7, clone_fraction=0, keep_fraction=0)
+    poisoned = np.full(cap, 0xFFFFFF40, np.uint32)       # pre_count + offset would wrap to slot 8
+    commands = p.structure_densifier._commands
+    original = commands.dispatch_indirect
+
+    def dispatch_indirect(kernel, name, args, **kwargs):
+        if name == "split_anisotropic":
+            kwargs["child_offset"] = _buffer(gpu_device, poisoned)
+        return original(kernel, name, args, **kwargs)
+    monkeypatch.setattr(commands, "dispatch_indirect", dispatch_indirect)
+    _densify_structure(p)
+    got = _read_gaussians(p, n)
+    owners = np.rint(got[:, 0] / SPACING).astype(int)
+    np.testing.assert_array_equal(owners, np.arange(n))  # no parent's slot holds another parent's child
+    np.testing.assert_array_equal(got, parents)          # no room anywhere, so every parent is intact
+
+
+# ---------------------------------------------------------------- radix sort ties
+
+def test_radix_sort_ties_keep_input_order_and_repeat(radix_kernels) -> None:
+    """Few distinct 64-bit keys over many partitions: equal keys keep their input order, every time."""
+    device, kernels = radix_kernels
+    n = 300_000
+    rng = np.random.default_rng(3)
+    keys_hi = rng.integers(0, 3, size=n, dtype=np.uint32)
+    keys_lo = rng.integers(0, 5, size=n, dtype=np.uint32)
+    values = np.arange(n, dtype=np.uint32)
+    order = np.argsort((keys_hi.astype(np.uint64) << np.uint64(32)) | keys_lo, kind="stable")
+    for _ in range(3):
+        _, _, got_v = _radix_sort(device, kernels, keys_lo, keys_hi, values)
+        np.testing.assert_array_equal(got_v, values[order])

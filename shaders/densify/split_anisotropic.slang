@@ -7,6 +7,7 @@
 #include "../common/types.slang"
 #include "../common/math.slang"
 #include "sh_carry.slang"
+#include "child_slots.slang"
 
 static const uint ACTION_SPLIT = 1;
 static const uint ACTION_CLONE = 2;
@@ -55,6 +56,7 @@ void prepareParent(uint i, uint lane, uint act,
     RWStructuredBuffer<Gaussian3D> gaussians,
     StructuredBuffer<uint> child_offset,
     uint pre_count,
+    uint max_splats,
     StructuredBuffer<uint> split_factor_x,
     StructuredBuffer<uint> split_factor_y,
     StructuredBuffer<uint> split_factor_z)
@@ -64,7 +66,7 @@ void prepareParent(uint i, uint lane, uint act,
         s_parent = gaussians[i];
         s_factors = act == ACTION_CLONE ? uint3(1u) : uint3(
             max(split_factor_x[i], 1u), max(split_factor_y[i], 1u), max(split_factor_z[i], 1u));
-        s_tail = pre_count + child_offset[i];
+        s_tail = tailStart(pre_count, child_offset[i], max_splats);
     }
     GroupMemoryBarrierWithGroupSync();
 }
@@ -101,7 +103,7 @@ void splitAnisotropic(
     uint lane = gtid.x;
     uint act = action[i];
     if (act != ACTION_SPLIT && act != ACTION_CLONE) return;
-    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0],
+    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0], max_splats,
                   split_factor_x, split_factor_y, split_factor_z);
     if (act == ACTION_CLONE)
     {
@@ -112,7 +114,7 @@ void splitAnisotropic(
         }
         return;
     }
-    uint total = s_factors.x * s_factors.y * s_factors.z;
+    uint total = gridSize(s_factors.x, s_factors.y, s_factors.z);
     if (total <= 1u) return;
     uint count = survivingChildren(total, max_splats);
     if (lane >= count) return;
@@ -154,7 +156,7 @@ void splitAnisotropicSH(
     uint lane = gtid.x;
     uint act = action[i];
     if (act != ACTION_SPLIT && act != ACTION_CLONE) return;
-    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0],
+    prepareParent(i, lane, act, gaussians, child_offset, pre_count_buf[0], max_splats,
                   split_factor_x, split_factor_y, split_factor_z);
 
     if (act == ACTION_CLONE)
@@ -167,7 +169,7 @@ void splitAnisotropicSH(
         }
         return;
     }
-    uint total = s_factors.x * s_factors.y * s_factors.z;
+    uint total = gridSize(s_factors.x, s_factors.y, s_factors.z);
     if (total <= 1u) return;
     uint count = survivingChildren(total, max_splats);
     if (lane >= count) return;

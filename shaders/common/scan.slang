@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Electronic Arts Inc. All rights reserved.
 
 // Exclusive prefix scan of a uint buffer (out[0] = 0) that also writes the total sum.
+// Sums saturate at 0xFFFFFFFF instead of wrapping (saturating addition is still associative), so a
+// huge total can never wrap an offset back into the live range.
 // Level-agnostic: the host chains 2 levels (n <= SCAN_BLOCK_SIZE^2) or 3 (n <= SCAN_BLOCK_SIZE^3).
 
 #ifndef TRAINER_SCAN_SLANG
@@ -12,6 +14,11 @@ static const uint SCAN_MAX_BLOCKS = 1024;
 
 groupshared uint _scan_lds[SCAN_BLOCK_SIZE];
 
+uint _scan_add(uint a, uint b)
+{
+    return a > 0xFFFFFFFFu - b ? 0xFFFFFFFFu : a + b;
+}
+
 // In-place exclusive Hillis-Steele scan of _scan_lds[0..count); returns the total.
 uint _scan_lds_inplace(uint lid, uint count)
 {
@@ -21,7 +28,7 @@ uint _scan_lds_inplace(uint lid, uint count)
         uint add_val = 0u;
         if (lid >= offset && lid < count) add_val = _scan_lds[lid - offset];
         GroupMemoryBarrierWithGroupSync();
-        if (lid < count) _scan_lds[lid] += add_val;
+        if (lid < count) _scan_lds[lid] = _scan_add(_scan_lds[lid], add_val);
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -86,7 +93,7 @@ void addBlockOffsets(
 {
     uint global_idx = gid.x * SCAN_BLOCK_SIZE + lid;
     if (global_idx >= n) return;
-    out_buf[global_idx] += block_sums[gid.x];
+    out_buf[global_idx] = _scan_add(out_buf[global_idx], block_sums[gid.x]);
 }
 
 #endif // TRAINER_SCAN_SLANG

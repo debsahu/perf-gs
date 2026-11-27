@@ -113,7 +113,7 @@ class SimpleDensifier:
             commands.dispatch(k.finish_allocation, "finish_child_allocation",
                 thread_count=[1, 1, 1], pre_count_buf=r.pre_count.storage,
                 growth_total=r.post_count.storage,
-                num_gaussians_counter=primitive.active_count.storage)
+                num_gaussians_counter=primitive.active_count.storage, max_splats=capacity)
             split_kwargs = dict(
                 gaussians=primitive.values.storage,
                 adam_state=adam.state.storage,

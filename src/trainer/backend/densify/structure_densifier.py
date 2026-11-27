@@ -227,7 +227,7 @@ class StructureDensifier:
             commands.dispatch(k.finish_allocation, "finish_child_allocation",
                 thread_count=[1, 1, 1], pre_count_buf=r.pre_count.storage,
                 growth_total=r.post_count.storage,
-                num_gaussians_counter=primitive.active_count.storage)
+                num_gaussians_counter=primitive.active_count.storage, max_splats=capacity)
 
             # One cooperative workgroup per selected parent; children go to its tail range.
             commands.dispatch(k.prepare_split, "structure_split_prepare_args",

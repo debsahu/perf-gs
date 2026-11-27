@@ -429,6 +429,14 @@ def find_mask_path(mask_dir: Path, image_name: str) -> Path | None:
     return None
 
 
+def require_some_mask(mask_dir: Path, image_names) -> None:
+    """Raise unless at least one image has a loss mask in ``mask_dir`` (the target dataset's own check)."""
+    names = list(image_names)
+    if not any(find_mask_path(Path(mask_dir), name) is not None for name in names):
+        raise FileNotFoundError(f"--masks {mask_dir}: no mask matched any of the {len(names)} images "
+                                "(looked for <image name>.png and <stem>.png)")
+
+
 def load_mask_file(path: Path, width: int, height: int, invert: bool = False) -> np.ndarray:
     """A loss mask as uint8 (H, W): 255 = keep the pixel, 0 = drop it.
 

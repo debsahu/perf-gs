@@ -11,7 +11,8 @@ import numpy as np
 import slangpy as spy
 
 from trainer.backend.compute.algorithms import PrefixScan, RadixSort
-from trainer.backend.compute.device import SHADERS_DIR
+from trainer.backend.compute.device import SHADERS_DIR, define_enabled
+from trainer.backend.compute.execution import TILE_HEIGHT, TILE_WIDTH
 from trainer.backend.compute.gpu import CommandRecorder, GpuRuntime
 from trainer.backend.compute.kernels import KernelLibrary
 from trainer.backend.densify.morton import MortonReorder
@@ -51,12 +52,19 @@ def _module_for_reflection(device: spy.Device,
     return spy.Module(session.load_module(str(SHADERS_DIR / "common" / "types.slang")))
 
 
-def default_sort_pairs(max_splats: int, viewer_only: bool = False) -> int:
-    """Sort-pair capacity for ``max_splats``; pairs past it are dropped (and counted)."""
+def default_sort_pairs(max_splats: int, viewer_only: bool = False, num_tiles: int = 0) -> int:
+    """Sort-pair capacity for ``max_splats``; pairs past it are dropped (and counted). Never past what the raster
+    checkpoints of a ``num_tiles`` frame can address."""
     if viewer_only:
-        return min(12_000_000, max(2_000_000, max_splats * 6))
-    # A splat may overlap many tiles even when the population fits its growth budget.
-    return max(buffers.DEFAULT_MAX_SORT_PAIRS, max_splats * 6)
+        pairs = min(12_000_000, max(2_000_000, max_splats * 6))
+    else:
+        # A splat may overlap many tiles even when the population fits its growth budget.
+        pairs = max(buffers.DEFAULT_MAX_SORT_PAIRS, max_splats * 6)
+    return min(pairs, buffers.max_sort_pairs_in_storage_range(num_tiles))
+
+
+def _num_tiles(width: int, height: int) -> int:
+    return buffers.ceil_div(width, TILE_WIDTH) * buffers.ceil_div(height, TILE_HEIGHT)
 
 
 def estimate_pipeline_bytes(module: spy.Module, *, max_splats: int, width: int,
@@ -64,7 +72,8 @@ def estimate_pipeline_bytes(module: spy.Module, *, max_splats: int, width: int,
                             viewer_only: bool = False, max_sort_pairs: int | None = None) -> int:
     """Base GPU bytes a pipeline of this shape allocates (no GPU work)."""
     sizes = {"max_splats": max_splats, "width": width, "height": height,
-             "max_sort_pairs": max_sort_pairs or default_sort_pairs(max_splats, viewer_only),
+             "max_sort_pairs": max_sort_pairs or default_sort_pairs(max_splats, viewer_only,
+                                                                    _num_tiles(width, height)),
              "sh_rest_floats": sh_rest_coeffs(sh_degree) * 3}
     if not viewer_only:
         sizes["structure_aware"] = structure_aware
@@ -107,11 +116,11 @@ class TrainingPipeline:
         # LOSS_MASK is compiled in (factory.shader_defines); the kernels that read the mask then
         # take the active target texture as an extra argument, so this must match the session.
         defines = self.slang_session.desc.compiler_options.defines or {}
-        self.loss_mask = bool(defines.get("LOSS_MASK"))
+        self.loss_mask = define_enabled(defines, "LOSS_MASK")
         self.width = width
         self.height = height
         self.max_splats = max_splats
-        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only)
+        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only, _num_tiles(width, height))
         self.viewer_only = viewer_only
         self.shared_data_module = _module_for_reflection(device, self.slang_session)
 
@@ -290,7 +299,8 @@ class TrainingPipeline:
         """Re-allocate a render-only pipeline for ``max_splats``; contents are lost."""
         assert self.viewer_only, "resizing a training pipeline would drop its state"
         self.max_splats = max_splats
-        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only=True)
+        self.max_sort_pairs = max_sort_pairs or default_sort_pairs(max_splats, viewer_only=True,
+                                                                   num_tiles=_num_tiles(self.width, self.height))
         # Release the old set first so both never coexist in VRAM.
         self.buffers = self.scan = self.sort = self.primitives = self.rasterizer = None
         self.buffers = buffers.allocate_viewer(

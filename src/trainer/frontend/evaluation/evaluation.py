@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from trainer.common.color import srgb_to_linear
-from trainer.common.metrics import psnr as psnr_image, psnr_masked, ssim as ssim_image
+from trainer.common.metrics import lossmask_view, psnr as psnr_image, ssim as ssim_image
 from trainer.frontend.run_control import Checkpoint, uninterrupted
 
 if TYPE_CHECKING:
@@ -51,7 +51,8 @@ def eval_test_psnr_srgb_masked(pipeline: "TrainingPipeline", scene,
                                checkpoint: Checkpoint = uninterrupted
                                ) -> tuple[float, float | None, int]:
     """Mean per-view sRGB PSNR over all pixels, and over the loss mask's kept pixels
-    (None without masks; views with no kept pixel are skipped), and the splat count."""
+    (None without masks; a view with no mask file keeps every pixel, views with no kept pixel are skipped),
+    and the splat count."""
     checkpoint()
     pipeline.runtime.wait_for_idle()
     n_g = pipeline.primitives.count()
@@ -64,7 +65,7 @@ def eval_test_psnr_srgb_masked(pipeline: "TrainingPipeline", scene,
         t = targets_srgb[cam_i][..., :3]
         frames.append(psnr_image(r, t))
         if keep_masks is not None:
-            value = psnr_masked(r, t, keep_masks[cam_i])
+            value, _ = lossmask_view(r, t, keep_masks[cam_i])
             if value is not None:
                 masked.append(value)
     checkpoint()
@@ -127,9 +128,8 @@ def run_eval_sweep(
         if mask.sum() > 0:
             psnr_srgb_mask_frames.append(psnr_image(r_srgb[mask], t_srgb[mask]))
         if keep_masks is not None:
-            keep = keep_masks[cam_i]
-            coverage_frames.append(1.0 if keep is None else float(keep.mean()))
-            value = psnr_masked(r_srgb, t_srgb, keep)
+            value, coverage = lossmask_view(r_srgb, t_srgb, keep_masks[cam_i])
+            coverage_frames.append(coverage)
             if value is not None:
                 psnr_lossmask_frames.append(value)
         if lpips_ready:

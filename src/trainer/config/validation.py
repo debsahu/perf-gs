@@ -16,31 +16,14 @@ class ConfigError(ValueError):
     """An invalid CLI/config combination, reported before anything is allocated."""
 
 
-SPEC_MIN_DISPATCH_GROUPS = 65_535
-
-
-def dispatch_groups_x(device) -> int:
-    """The device's maximum compute dispatch width along X; the Vulkan-spec minimum when unknown."""
-    try:
-        return int(device.info.limits.max_compute_dispatch_thread_groups[0])
-    except (AttributeError, TypeError, IndexError):
-        return SPEC_MIN_DISPATCH_GROUPS
-
-
-def max_sort_pairs_limit(max_dispatch_groups: int = SPEC_MIN_DISPATCH_GROUPS) -> int:
-    """Largest --max-sort-pairs: the radix sort dispatches one group per RADIX_PART_SIZE keys along X, and each of
-    its six pair buffers (capacity x 4 bytes) must stay within a 4 GiB storage-buffer range.
-
-    The 4 GiB is hard-coded: slangpy 0.42 exposes max_compute_dispatch_thread_groups but not the device's
-    maxStorageBufferRange (4 GiB - 1 on MoltenVK and on a Pascal desktop GPU). This is an addressing bound, not a memory
-    budget: six buffers at the cap need ~24 GiB, so a device without that much fails loudly at allocation."""
-    from trainer.backend.compute.execution import RADIX_PART_SIZE
-    groups = min(int(max_dispatch_groups), (2**32 - 1) // (4 * RADIX_PART_SIZE))
-    return groups * RADIX_PART_SIZE
+# The radix sort's --max-sort-pairs ceiling at the Vulkan-spec minimum dispatch width: 65,535 groups of 2,048 keys.
+# The frontend passes the device's own ceiling (trainer.backend.memory.buffers.max_sort_pairs_limit); this layer
+# imports no backend module, so the default is a literal that tests/test_sort_dispatch_limit.py pins to the backend's.
+SPEC_MAX_SORT_PAIRS = 65_535 * 2_048
 
 
 def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: int,
-                             n_test: int, max_dispatch_groups: int = SPEC_MIN_DISPATCH_GROUPS) -> None:
+                             n_test: int, max_sort_pairs_limit: int = SPEC_MAX_SORT_PAIRS) -> None:
     """Reject combinations that would crash mid-run or silently do nothing.
 
     Runs once the scene and holdout split are known; the CLI defaults always pass.
@@ -60,11 +43,11 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
         raise ConfigError(f"--max-splats must be >= 1, got {args.max_splats}.")
     if not 0.0 < args.final_splat_fraction <= 1.0:
         raise ConfigError("--final-splat-fraction must be in (0, 1].")
-    # The radix sort dispatches one group per 2,048 keys along a single GPU dimension: 65,535 groups is the
-    # Vulkan-spec minimum, but the caller passes the device's own limit when it knows it.
-    max_pairs = max_sort_pairs_limit(max_dispatch_groups)
-    if args.max_sort_pairs is not None and not 1 <= args.max_sort_pairs <= max_pairs:
-        raise ConfigError(f"--max-sort-pairs must be between 1 and {max_pairs:,}.")
+    # The radix sort dispatches one group per 2,048 keys along a single GPU dimension (65,535 groups is the
+    # Vulkan-spec minimum), and the raster checkpoints must fit one storage buffer: the caller passes the ceiling
+    # for its device and frame size when it knows them.
+    if args.max_sort_pairs is not None and not 1 <= args.max_sort_pairs <= max_sort_pairs_limit:
+        raise ConfigError(f"--max-sort-pairs must be between 1 and {max_sort_pairs_limit:,}.")
 
     # densify_every is a modulo divisor of the schedule, not a "disable" value.
     if args.densify_every < 1:

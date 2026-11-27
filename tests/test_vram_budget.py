@@ -185,7 +185,10 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str) -> np.ndarray:
         assert ram["linear_cache_bytes"] == 0
         packed_bytes = 2 * 16 * 16 * 4
         if residency == "stream":
-            assert ram["packed_training_images_bytes"] == packed_bytes
+            # the packed uint8 RGBA targets ARE the decoded arrays (one host copy): counted once, in decoded
+            assert all(np.shares_memory(app.target_textures[i], app._targets.resident[i]) for i in app.target_textures)
+            assert len(app.target_textures) * 16 * 16 * 4 == packed_bytes
+            assert ram["packed_training_images_bytes"] == 0
             assert cache == {"training_images_bytes": 0, "structure_fields_bytes": 0}
         else:
             assert ram["packed_training_images_bytes"] == 0

@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 
 from trainer.backend.compute.execution import RADIX_PART_SIZE
-from trainer.config.validation import ConfigError, dispatch_groups_x, max_sort_pairs_limit, validate_training_config
+from trainer.backend.compute.device import dispatch_groups_x
+from trainer.backend.memory.buffers import max_sort_pairs_limit
+from trainer.config.validation import SPEC_MAX_SORT_PAIRS, ConfigError, validate_training_config
 from trainer.frontend.cli import build_parser
 
 OLD_CEILING = 65_535 * 2_048          # 134,215,680
@@ -22,8 +24,13 @@ def _args(pairs: int):
 
 
 def _validate(pairs: int, groups: int | None = None) -> None:
-    kw = {} if groups is None else {"max_dispatch_groups": groups}
+    kw = {} if groups is None else {"max_sort_pairs_limit": max_sort_pairs_limit(groups)}
     validate_training_config(_args(pairs), n_cams=8, n_train=8, n_test=1, **kw)
+
+
+def test_config_default_ceiling_is_the_backend_spec_ceiling() -> None:
+    """config/ imports no backend module, so its default ceiling is a literal: pin it to the backend's value."""
+    assert SPEC_MAX_SORT_PAIRS == max_sort_pairs_limit() == OLD_CEILING
 
 
 def test_default_ceiling_is_unchanged() -> None:
@@ -33,15 +40,16 @@ def test_default_ceiling_is_unchanged() -> None:
 
 
 def test_device_limit_raises_the_ceiling() -> None:
-    _validate(402_653_184, groups=1 << 30)                     # a full-res run's value
+    _validate(200_000_000, groups=1 << 30)                     # above the old ceiling, inside the checkpoint range
     with pytest.raises(ConfigError, match="max-sort-pairs"):
-        _validate(402_653_184, groups=65_535)
+        _validate(200_000_000, groups=65_535)
 
 
 def test_ceiling_also_bounded_by_a_4gib_storage_buffer() -> None:
     # each of the six pair buffers holds capacity * 4 bytes and must stay addressable by a uint32 byte offset
+    # (raster_checkpoints, below, is the tighter bound, so this one is not tight)
     cap = max_sort_pairs_limit(1 << 31)
-    assert cap % RADIX_PART_SIZE == 0 and cap * 4 <= 2**32 - 1 < (cap + RADIX_PART_SIZE) * 4
+    assert cap % RADIX_PART_SIZE == 0 and cap * 4 <= 2**32 - 1
     _validate(cap, groups=1 << 31)
     with pytest.raises(ConfigError, match="max-sort-pairs"):
         _validate(cap + 1, groups=1 << 31)
@@ -92,3 +100,57 @@ def test_radix_sort_beyond_65535_groups(radix_kernels) -> None:
 
 
 from test_radix_sort import radix_kernels  # noqa: E402,F401  (module fixture reused)
+
+
+# raster_checkpoints is the largest buffer that grows with --max-sort-pairs: one uint2 per tile pixel per bucket,
+# (ceil(pairs / RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA * 8 bytes, about 16 bytes per pair. It must stay inside a
+# 4 GiB - 1 storage-buffer range too, which bounds the pairs ~4x tighter than the 4-byte pair arrays do.
+RANGE = 2**32 - 1
+
+
+def _checkpoint_bytes(pairs: int, num_tiles: int) -> int:
+    from trainer.backend.compute.execution import RASTER_BUCKET_SIZE, TILE_AREA
+    return (-(-pairs // RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA * 8
+
+
+def test_ceiling_keeps_raster_checkpoints_inside_a_4gib_buffer() -> None:
+    cap = max_sort_pairs_limit(1 << 31)
+    assert 0 < _checkpoint_bytes(cap, 0) <= RANGE, cap
+    # tight: one more radix part would not fit, so the bound is the checkpoint buffer and not something smaller
+    assert _checkpoint_bytes(cap + RADIX_PART_SIZE, 0) > RANGE
+    assert cap > OLD_CEILING                                    # the device limit still lifts the old ceiling
+
+
+@pytest.mark.parametrize("num_tiles", [1, 4_096, 750_000])
+def test_ceiling_counts_the_frame_tiles(num_tiles: int) -> None:
+    cap = max_sort_pairs_limit(1 << 31, num_tiles=num_tiles)
+    assert _checkpoint_bytes(cap, num_tiles) <= RANGE < _checkpoint_bytes(cap + RADIX_PART_SIZE, num_tiles)
+    with pytest.raises(ConfigError, match="max-sort-pairs"):
+        validate_training_config(_args(cap + 1), n_cams=8, n_train=8, n_test=1, max_sort_pairs_limit=cap)
+
+
+def test_allocation_refuses_checkpoints_past_4gib(gpu_device) -> None:
+    """The allocator itself refuses an oversized checkpoint buffer, for callers that skip validation (viewer, API)."""
+    from trainer.backend.memory.buffers import estimate_allocation_bytes
+    from trainer.backend.render.pipeline import TrainingPipeline
+    module = TrainingPipeline(gpu_device, 16, 16, max_splats=16).shared_data_module
+    sizes = dict(max_splats=16, width=16, height=16, sh_rest_floats=0)
+    fits = max_sort_pairs_limit(1 << 31, num_tiles=4)
+    assert estimate_allocation_bytes(module, max_sort_pairs=fits, **sizes) > _checkpoint_bytes(fits, 4)
+    for viewer_only in (False, True):
+        with pytest.raises(ValueError, match="raster_checkpoints"):
+            estimate_allocation_bytes(module, viewer_only=viewer_only, max_sort_pairs=402_653_184, **sizes)
+
+
+def test_default_sort_pairs_stay_inside_the_checkpoint_range() -> None:
+    from trainer.backend.render.pipeline import default_sort_pairs
+    pairs = default_sort_pairs(200_000_000, num_tiles=10_000)    # 6 per splat would be 1.2 G pairs
+    assert _checkpoint_bytes(pairs, 10_000) <= RANGE
+
+
+@pytest.mark.parametrize("groups", [(0, 1, 1), (-5, 1, 1), ("wide", 1, 1), (None, 1, 1)],
+                         ids=["zero", "negative", "not-a-number", "none"])
+def test_dispatch_groups_x_falls_back_on_a_bad_device_value(groups) -> None:
+    """A device that reports no usable width must not set the sort ceiling to 0 or crash."""
+    dev = SimpleNamespace(info=SimpleNamespace(limits=SimpleNamespace(max_compute_dispatch_thread_groups=groups)))
+    assert dispatch_groups_x(dev) == 65_535

@@ -57,8 +57,9 @@ float3 _sample_structure_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
     return acc;
 }
 
-// Bilinear keep fraction at p from the field's .w (the target's keep mask under LOSS_MASK). Taps
-// outside the image count as kept: there is no mask there, and the unmasked rule then applies.
+// Bilinear keep fraction at p from the field's .w (the target's keep mask under LOSS_MASK), over the taps inside
+// the image only: a sample in the last pixel of a dropped border is dropped, whatever lies past the edge. A sample
+// with no tap inside counts as kept: there is no mask there, and the unmasked rule then applies.
 float _sample_keep_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
 {
     float2 pf = floor(p);
@@ -66,6 +67,7 @@ float _sample_keep_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
     float2 f = p - pf;
     int W = int(dim.x), H = int(dim.y);
     float keep = 0.0;
+    float inside_weight = 0.0;
     [unroll]
     for (int dy = 0; dy < 2; ++dy)
     {
@@ -74,12 +76,13 @@ float _sample_keep_bilinear(Texture2D<float4> tex, float2 p, uint2 dim)
         {
             int tx = i0.x + dx;
             int ty = i0.y + dy;
+            if (tx < 0 || tx >= W || ty < 0 || ty >= H) continue;
             float w = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
-            bool inside = tx >= 0 && tx < W && ty >= 0 && ty < H;
-            keep += w * (inside ? tex[int2(tx, ty)].w : 1.0);
+            keep += w * tex[int2(tx, ty)].w;
+            inside_weight += w;
         }
     }
-    return keep;
+    return inside_weight > 0.0 ? keep / inside_weight : 1.0;
 }
 
 // Top eigenvalue of the packed symmetric 2x2 tensor (Sxx, Sxy, Syy).

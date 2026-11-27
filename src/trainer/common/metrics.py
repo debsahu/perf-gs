@@ -29,6 +29,15 @@ def psnr_masked(rendered: np.ndarray, target: np.ndarray, keep: np.ndarray | Non
     return psnr(rendered[keep], target[keep])
 
 
+def lossmask_view(rendered: np.ndarray, target: np.ndarray,
+                  keep: np.ndarray | None) -> tuple[float | None, float]:
+    """(PSNR over the kept pixels, kept fraction) of one view under ``--masks``. A view with no mask file
+    (``keep`` None) keeps every pixel: its whole-image PSNR and coverage 1.0. The PSNR is None when no pixel is kept."""
+    if keep is None:
+        return psnr(rendered, target), 1.0
+    return psnr_masked(rendered, target, keep), float(keep.mean())
+
+
 def ssim_gaussian_window(window_size: int = 11, sigma: float = 1.5) -> np.ndarray:
     """Normalized 1D Gaussian window, matching the 3DGS / SAD-GS SSIM."""
     coords = np.arange(window_size) - window_size // 2

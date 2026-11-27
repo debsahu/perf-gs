@@ -14,7 +14,7 @@ import numpy as np
 
 from trainer.common.color import srgb_to_linear as _srgb_to_linear
 from trainer.backend.export import save_ply
-from trainer.common.metrics import psnr as _psnr_image, psnr_masked as _psnr_masked, ssim as _ssim_image
+from trainer.common.metrics import lossmask_view as _lossmask_view, psnr as _psnr_image, ssim as _ssim_image
 from trainer.frontend.evaluation.evaluation import render_all_cameras
 from trainer.frontend.evaluation.psnr_plot import write_psnr_curve
 from trainer.frontend.run_control import Checkpoint, uninterrupted
@@ -116,9 +116,9 @@ def run_post_training(
                                     if mask.sum() > 0 else 0.0),
             })
             if keep_masks is not None:
-                # Over the loss mask's kept pixels; None when a view keeps no pixel.
-                per_cam[-1]["psnr_srgb_lossmask"] = _psnr_masked(r_srgb, t_srgb, keep_masks[cam_i])
-                per_cam[-1]["lossmask_coverage"] = float(keep_masks[cam_i].mean())
+                # Over the loss mask's kept pixels (a view without a mask keeps all); None when it keeps none.
+                per_cam[-1]["psnr_srgb_lossmask"], per_cam[-1]["lossmask_coverage"] = _lossmask_view(
+                    r_srgb, t_srgb, keep_masks[cam_i])
 
             checkpoint()
         test_set = set(test_indices)

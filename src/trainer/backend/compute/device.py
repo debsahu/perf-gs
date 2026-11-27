@@ -11,7 +11,7 @@ from typing import Literal
 
 import slangpy as spy
 
-Backend = Literal["vulkan", "d3d12"]
+Backend = Literal["vulkan", "d3d12", "metal"]
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 SHADERS_DIR = Path(str(files("trainer").joinpath("shaders")))
@@ -23,6 +23,30 @@ _BACKEND_MAP: dict[Backend, spy.DeviceType] = {
     "d3d12": spy.DeviceType.d3d12,
     "metal": spy.DeviceType.metal,
 }
+
+
+SPEC_MIN_DISPATCH_GROUPS = 65_535
+
+
+def dispatch_groups_x(device) -> int:
+    """The device's maximum compute dispatch width along X; the Vulkan-spec minimum when unknown or not positive."""
+    try:
+        groups = int(device.info.limits.max_compute_dispatch_thread_groups[0])
+    except (AttributeError, TypeError, IndexError, ValueError):
+        return SPEC_MIN_DISPATCH_GROUPS
+    return groups if groups > 0 else SPEC_MIN_DISPATCH_GROUPS
+
+
+def define_enabled(defines: dict[str, str] | None, name: str) -> bool:
+    """Whether Slang's ``#if name`` is true under ``defines``: absent or "0" is off, any other integer is on.
+    ``bool(value)`` would read the string "0" as on."""
+    value = (defines or {}).get(name)
+    if value is None:
+        return False
+    try:
+        return int(str(value).strip(), 0) != 0
+    except ValueError as exc:
+        raise ValueError(f"shader define {name}={value!r} is not an integer") from exc
 
 
 def create_device(

@@ -5,14 +5,14 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 
 from trainer.backend.densify.morton import morton_bounds
-from trainer.data.colmap import ColmapDataset, ColmapImageEntry, load_colmap
+from trainer.data.colmap import ColmapDataset, ColmapImageEntry, load_colmap, require_some_mask
 from trainer.data.dataset import Camera
 
 
@@ -60,7 +60,10 @@ def holdout_split(camera_count: int, stride: int,
             [i for i in range(camera_count) if i % stride != 0])
 
 
-def load_scene_context(args: argparse.Namespace, prepared: ColmapDataset | None = None) -> SceneContext:
+def load_scene_context(args: argparse.Namespace, prepared: ColmapDataset | None = None,
+                       validate: Callable[[int, list[int], list[int], int, int], None] | None = None) -> SceneContext:
+    """Load the scene and split it. ``validate(camera_count, train, test, width, height)`` runs before stereo
+    seeding, so a refused run costs no triangulation."""
     if prepared is None:
         colmap_scene = load_colmap(args.scene, width=args.width, height=args.height,
                                   downsample=args.downsample, init_opacity=args.init_opacity)
@@ -75,10 +78,15 @@ def load_scene_context(args: argparse.Namespace, prepared: ColmapDataset | None 
 
     stride = max(args.eval_holdout_stride, 1)
     test_indices, train_indices = holdout_split(camera_count, stride, bool(args.eval_holdout))
+    if validate is not None:
+        validate(camera_count, train_indices, test_indices, width, height)
     if getattr(args, "stereo_init", False) and initial_count < args.max_splats:
         from trainer.data.stereo import DEFAULT_SEED_LIMIT, seed_from_stereo
         limit = min(DEFAULT_SEED_LIMIT, args.max_splats - initial_count)
         masks = getattr(args, "masks", None)
+        if masks:
+            # The target dataset refuses a mask directory that matches no image; refuse it before triangulating.
+            require_some_mask(Path(masks), [image.image_name for image in colmap_scene.images])
         # Loss masks drop seeds on masked pixels; without them the call is unchanged.
         mask_kwargs = ({"masks_dir": Path(masks), "invert_masks": bool(getattr(args, "invert_masks", False))}
                        if masks else {})

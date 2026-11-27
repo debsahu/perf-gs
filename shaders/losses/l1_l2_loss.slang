@@ -49,7 +49,8 @@ void computeLossGrad(
 
     float grad_alpha = 0.0;
 #if LOSS_MASK
-    grad_rgb *= target.a;
+    // Select, not multiply: NaN * 0 is NaN, and nothing keeps a dropped pixel's render finite.
+    grad_rgb = target.a > 0.0 ? grad_rgb * target.a : float3(0.0);
 #else
     if (w_alpha > 0.0)
     {

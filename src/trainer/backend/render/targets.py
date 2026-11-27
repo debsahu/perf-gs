@@ -13,9 +13,12 @@ _TEXTURE_USAGE = spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_a
 
 
 def srgb01_to_u8(rgba: np.ndarray) -> np.ndarray:
-    """Quantize [0, 1] sRGB to contiguous uint8 (round to nearest); uint8 passes through."""
+    """Quantize [0, 1] sRGB to contiguous uint8 (round to nearest); uint8 passes through. Other integer types are
+    refused: a raw 16-bit decode read as [0, 1] would clip almost every pixel to 255."""
     if rgba.dtype == np.uint8:
         return np.ascontiguousarray(rgba)
+    if not np.issubdtype(rgba.dtype, np.floating):
+        raise TypeError(f"targets are uint8 or [0, 1] float sRGB, got {rgba.dtype}")
     u8 = np.clip(np.rint(rgba.astype(np.float32) * 255.0), 0, 255).astype(np.uint8)
     return np.ascontiguousarray(u8)
 

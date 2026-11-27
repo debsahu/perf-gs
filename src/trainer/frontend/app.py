@@ -16,9 +16,11 @@ from typing import Any
 import numpy as np
 import slangpy as spy
 
+from trainer.backend.compute.device import dispatch_groups_x
 from trainer.backend.densify.removal import accumulate_removal_cost, prune_by_removal_cost
 from trainer.backend.densify.structure_tensor import StructureTensor
 from trainer.backend.memory.budget import GIB, allocated_bytes, available_bytes, fit_capacity
+from trainer.backend.memory.buffers import frame_tiles, max_sort_pairs_limit
 from trainer.backend.platform.dxgi import query_video_memory
 from trainer.backend.render.pipeline import (
     TrainingPipeline,
@@ -32,7 +34,7 @@ from trainer.config.config import (
 )
 from trainer.config.config_types import DensificationMode, LearningRateRecipe
 from trainer.config.resolve import RunConfig, shader_specialization
-from trainer.config.validation import dispatch_groups_x, validate_training_config
+from trainer.config.validation import validate_training_config
 from trainer.data.parallel import map_ordered
 from trainer.data.targets import TargetDataset
 from trainer.frontend.cli import parse_args
@@ -171,11 +173,12 @@ class TrainingApplication:
     def _prepare_scene(self, scene_dir, prepared=None) -> None:
         """Load the scene and resolve what depends on it; not the device, pipeline or viewer."""
         self.args.scene = str(scene_dir)
-        self.scene_context = scene = load_scene_context(self.args, prepared)
-        validate_training_config(self.args, n_cams=scene.camera_count,
-                                 n_train=len(scene.train_indices),
-                                 n_test=len(scene.test_indices),
-                                 max_dispatch_groups=dispatch_groups_x(getattr(self, "device", None)))
+        def validate(n_cams: int, train: list[int], test: list[int], width: int, height: int) -> None:
+            limit = max_sort_pairs_limit(dispatch_groups_x(getattr(self, "device", None)), frame_tiles(width, height))
+            validate_training_config(self.args, n_cams=n_cams, n_train=len(train), n_test=len(test),
+                                     max_sort_pairs_limit=limit)
+
+        self.scene_context = scene = load_scene_context(self.args, prepared, validate=validate)
         self.config = RunConfig.from_args(self.args, scene.extent)
         self._write_resolved_config()
         self._prepare_target_dataset()
@@ -320,8 +323,12 @@ class TrainingApplication:
                 "working_set_bytes": ram.rss or None,
                 "peak_working_set_bytes": ram.peak_rss or None,
                 **self._targets.host_image_bytes(),
+                # Packed views not already counted in decoded_images_bytes: in stream residency a uint8 target is
+                # packed by reference, so its packed view IS the decoded array.
                 "packed_training_images_bytes": sum(
-                    image.nbytes for image in self.target_textures.values() if isinstance(image, np.ndarray)),
+                    image.nbytes for index, image in self.target_textures.items()
+                    if isinstance(image, np.ndarray)
+                    and not np.may_share_memory(image, self._targets.resident[index])),
             }
             # Per-view textures live outside pipeline.buffers. Streamed views share scratch space.
             summary["gpu_view_cache"] = {

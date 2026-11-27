@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 
 from trainer.backend.memory.budget import allocated_bytes
-from trainer.common.metrics import psnr as psnr_image, psnr_masked, ssim as ssim_image
+from trainer.common.metrics import lossmask_view, psnr as psnr_image, ssim as ssim_image
 from trainer.frontend.run_control import Checkpoint, uninterrupted
 
 if TYPE_CHECKING:
@@ -203,8 +203,8 @@ def evaluate_test_views(
             **_overdraw(pipeline, image[..., 3]),
         }
         if keep_masks is not None:
-            record["psnr_srgb_lossmask"] = psnr_masked(rendered, target, keep_masks[cam_i])
-            record["lossmask_coverage"] = float(keep_masks[cam_i].mean())
+            record["psnr_srgb_lossmask"], record["lossmask_coverage"] = lossmask_view(
+                rendered, target, keep_masks[cam_i])
         # Same float render as PSNR/SSIM, so all three metrics describe one image.
         record["lpips"] = (perceptual.lpips(rendered, target)
                                 if lpips_ready else None)

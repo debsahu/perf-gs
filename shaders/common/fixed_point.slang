@@ -23,6 +23,5 @@ void atomicAdd64(RWStructuredBuffer<I64Atomic> b, uint i, int64_t v)
     uint carry = ((old + lo) < old) ? 1u : 0u;
     InterlockedAdd(b[i].hi, hi + carry);
 }
-int64_t loadI64(I64Atomic a) { return int64_t((uint64_t(a.hi) << 32) | uint64_t(a.lo)); }
 
 #endif // TRAINER_FIXED_POINT_SLANG

@@ -48,6 +48,53 @@ def max_raster_buckets(max_sort_pairs: int, num_tiles: int) -> int:
     return ceil_div(max_sort_pairs, RASTER_BUCKET_SIZE) + num_tiles
 
 
+# maxStorageBufferRange on MoltenVK and on a Pascal desktop GPU. slangpy 0.42 does not expose the device's value.
+STORAGE_BUFFER_RANGE = 2**32 - 1
+RASTER_CHECKPOINT_STRIDE = 8          # one uint2 per tile pixel per bucket
+
+
+def max_sort_pairs_in_storage_range(num_tiles: int) -> int:
+    """Largest max_sort_pairs whose raster_checkpoints buffer fits one storage-buffer range.
+
+    That buffer, (ceil(pairs / RASTER_BUCKET_SIZE) + num_tiles) * TILE_AREA uint2, is the largest one that grows with
+    the sort capacity: about 16 bytes per pair, 4x the 4-byte sort pair arrays."""
+    buckets = STORAGE_BUFFER_RANGE // (TILE_AREA * RASTER_CHECKPOINT_STRIDE) - num_tiles
+    return max(0, buckets * RASTER_BUCKET_SIZE)
+
+
+SPEC_MIN_DISPATCH_GROUPS = 65_535
+
+
+def frame_tiles(width: int, height: int) -> int:
+    """8x8 raster tiles of a ``width`` x ``height`` frame."""
+    num_tiles_x, num_tiles_y = _tile_grid(width, height)
+    return num_tiles_x * num_tiles_y
+
+
+def max_sort_pairs_limit(max_dispatch_groups: int = SPEC_MIN_DISPATCH_GROUPS, num_tiles: int = 0) -> int:
+    """Largest --max-sort-pairs: the radix sort dispatches one group per RADIX_PART_SIZE keys along X, and every
+    buffer that grows with the capacity must stay within a 4 GiB storage-buffer range. The largest is
+    raster_checkpoints (about 16 bytes per pair plus 512 bytes per 8x8 tile of the frame, ``num_tiles``), so it sets
+    the bound, not the 4-byte pair arrays.
+
+    The 4 GiB is hard-coded: slangpy 0.42 exposes max_compute_dispatch_thread_groups but not the device's
+    maxStorageBufferRange (4 GiB - 1 on MoltenVK and on a Pascal desktop GPU). This is an addressing bound, not a memory
+    budget: a device without the memory fails loudly at allocation."""
+    groups = min(int(max_dispatch_groups), STORAGE_BUFFER_RANGE // (4 * RADIX_PART_SIZE))
+    by_range = max_sort_pairs_in_storage_range(int(num_tiles)) // RADIX_PART_SIZE * RADIX_PART_SIZE
+    return min(groups * RADIX_PART_SIZE, by_range)
+
+
+def _checkpoint_elements(max_sort_pairs: int, num_tiles: int) -> int:
+    elements = max_raster_buckets(max_sort_pairs, num_tiles) * TILE_AREA
+    if elements * RASTER_CHECKPOINT_STRIDE > STORAGE_BUFFER_RANGE:
+        raise ValueError(
+            f"max_sort_pairs {max_sort_pairs:,} needs a {elements * RASTER_CHECKPOINT_STRIDE / 2**30:.2f} GiB "
+            f"raster_checkpoints buffer, past the 4 GiB storage-buffer range; at {num_tiles:,} tiles the "
+            f"largest is {max_sort_pairs_in_storage_range(num_tiles):,}")
+    return elements
+
+
 _DEFAULT_BUFFER_USAGE = (
     spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access)
 
@@ -461,7 +508,7 @@ def allocate(
     bucket_offsets = allocator.uint_buffer("bucket_offsets", num_tiles)
     bucket_offset_total = allocator.uint_buffer("bucket_offset_total", 1)
     raster_checkpoints = allocator.typed_buffer(
-        "raster_checkpoints", "uint2", max_buckets * TILE_AREA)
+        "raster_checkpoints", "uint2", _checkpoint_elements(max_sort_pairs, num_tiles))
     backward = BackwardResources(
         live_bucket_count=allocator.uint_buffer("live_bucket_count", num_tiles),
         live_bucket_offsets=allocator.uint_buffer("live_bucket_offsets", num_tiles),
@@ -598,7 +645,6 @@ def allocate_viewer(
     allocator = _allocator if _allocator is not None else _Alloc(device, width, height)
     num_tiles_x, num_tiles_y = _tile_grid(width, height)
     num_tiles = num_tiles_x * num_tiles_y
-    max_buckets = max_raster_buckets(max_sort_pairs, num_tiles)
 
     primitive_values = allocator.typed_buffer("primitive.values", types.gaussian, max_splats)
     active_count = allocator.uint_buffer("primitive.active_count", 1)
@@ -617,7 +663,7 @@ def allocate_viewer(
     bucket_offsets = allocator.uint_buffer("bucket_offsets", num_tiles)
     bucket_offset_total = allocator.uint_buffer("bucket_offset_total", 1)
     raster_checkpoints = allocator.typed_buffer(
-        "raster_checkpoints", "uint2", max_buckets * TILE_AREA)
+        "raster_checkpoints", "uint2", _checkpoint_elements(max_sort_pairs, num_tiles))
     output_image = allocator.tex(spy.Format.rgba32_float, "output_image")
     gaussian_count_per_pixel = allocator.tex(spy.Format.r32_uint, "gaussian_count_per_pixel")
     scan = _allocate_scan(allocator, max_splats, with_work=False)

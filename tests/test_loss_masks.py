@@ -538,3 +538,187 @@ def test_structure_field_carries_the_target_alpha():
     field = StructureTensor(p.device, SIZE, SIZE).build_textures({0: texture})[0].to_numpy()
     np.testing.assert_array_equal(field[..., 3].astype(np.float32) == 1.0, keep)
     assert (field[~keep, 3] == 0).all()
+
+
+def _mixed_mask_eval_fixture():
+    """Three views, the middle one masked: a view without a mask (None) keeps every pixel, so its loss-masked PSNR is
+    its whole-image PSNR and its coverage 1.0. The views' errors differ, so dropping a None view from a mean, or
+    counting it as fully dropped, changes the number."""
+    from types import SimpleNamespace
+    render = np.full((8, 8, 4), 0.25, np.float32)
+    pipeline = SimpleNamespace(
+        runtime=SimpleNamespace(wait_for_idle=lambda: None), primitives=SimpleNamespace(count=lambda: 7),
+        render=lambda _camera: None, read_output_image=lambda: render,
+        read_bin_debug=lambda: (np.zeros(1, np.uint32), np.zeros((8, 8), np.uint32), 1, 1),
+        mip_filter=SimpleNamespace(compute=lambda: None))
+    scene = SimpleNamespace(images=[SimpleNamespace(camera=i, image_name=f"{i}.png") for i in range(3)])
+    targets = [np.full((8, 8, 3), v, np.float32) for v in (0.5, 0.3, 0.6)]
+    keep = np.zeros((8, 8), bool)
+    keep[:4] = True
+    targets[1][4:] = 0.9                                   # dropped rows: a large error the mask hides
+    from trainer.common.metrics import psnr
+    whole = [psnr(np.full((8, 8, 3), 0.25, np.float32), t) for t in targets]
+    kept1 = psnr(np.full((4, 8, 3), 0.25, np.float32), targets[1][:4])
+    assert len({round(v, 6) for v in (whole[0], kept1, whole[2])}) == 3 and kept1 != whole[1]
+    expected = {0: whole[0], 1: kept1, 2: whole[2]}
+    return pipeline, scene, targets, [None, keep, None], expected
+
+
+def test_loss_masked_eval_treats_a_view_without_a_mask_as_all_kept(tmp_path, monkeypatch):
+    import io
+    import json
+    import time
+    from types import SimpleNamespace
+    from trainer.frontend.evaluation import evaluation, post_training, run_report
+    pipeline, scene, targets, keep_masks, expected = _mixed_mask_eval_fixture()
+
+    views, _ = run_report.evaluate_test_views(pipeline, scene, [0, 1, 2], targets, render_dir=None,
+                                              keep_masks=keep_masks)
+    assert [v["psnr_srgb_lossmask"] for v in views] == pytest.approx([expected[i] for i in range(3)])
+    assert [v["lossmask_coverage"] for v in views] == [1.0, 0.5, 1.0]
+
+    _, masked, _ = evaluation.eval_test_psnr_srgb_masked(pipeline, scene, [0, 1, 2], targets, keep_masks)
+    assert masked == pytest.approx(np.mean(list(expected.values())))
+
+    stream = io.StringIO()
+    evaluation.run_eval_sweep(pipeline=pipeline, scene=scene, it=1, test_indices=[0, 1, 2], targets_srgb=targets,
+                              targets_linear=lambda i: targets[i], cams_dir=tmp_path / "cams",
+                              eval_curve_json=stream, t_start=time.time(), eval_time_total=0.0, eval_holdout=True,
+                              keep_masks=keep_masks)
+    row = json.loads(stream.getvalue().splitlines()[-1])
+    assert row["psnr_srgb_lossmask"] == pytest.approx(np.mean(list(expected.values())))
+    assert row["lossmask_coverage"] == pytest.approx(2.5 / 3)
+
+    monkeypatch.setattr(post_training, "save_ply", lambda *_args: None)
+    post_training.run_post_training(
+        pipeline=pipeline, scene=scene,
+        args=SimpleNamespace(profile_run=False, compute_final_metrics=True, evaluation=True, psnr_curve=False,
+                             mip_splatting=False, iters=1, eval_holdout=True, save_ply=False),
+        run_dir=tmp_path, cams_dir=tmp_path / "cams", targets_srgb=targets, targets_linear=lambda i: targets[i],
+        test_indices=[0, 1, 2], stride=1, n_cams=3, train_wall_s=1.0, completed_iters=1, t_start=time.time(),
+        keep_masks=keep_masks)
+    summary = json.loads((tmp_path / "final_psnr.json").read_text())
+    assert summary["psnr_srgb_lossmask"] == pytest.approx(np.mean(list(expected.values())))
+    assert summary["lossmask_coverage"] == pytest.approx(2.5 / 3)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("1", True), (None, False)])
+def test_pipeline_reads_loss_mask_as_the_shader_does(value, expected):
+    """Slang's #if LOSS_MASK is false for "0"; the pipeline must agree, or --masks passes require_loss_mask on
+    shaders that never read the mask (and every masked dispatch binds a parameter the kernel lacks)."""
+    from trainer.backend.compute.device import create_device
+    try:
+        device = create_device(backend="vulkan", defines=None if value is None else {"LOSS_MASK": value})
+    except Exception as exc:  # pragma: no cover - device availability
+        pytest.skip(f"vulkan unavailable: {exc}")
+    pipeline = TestPipeline(device=device, width=SIZE, height=SIZE, max_splats=64)
+    assert pipeline.loss_mask is expected
+
+
+def _edge_splats(axis: int, n: int = 512):
+    """n tiny splats whose mean projects a quarter pixel inside the last column (axis 0) or row (axis 1)."""
+    cam = _camera()
+
+    def pixel(world):
+        clip = cam.proj_matrix @ (cam.view_matrix @ np.append(world, 1.0))
+        return (clip[:2] / clip[3] * 0.5 + 0.5) * SIZE
+
+    z = 3.0
+    base, unit = pixel(np.array([0.0, 0.0, z])), np.eye(3)[axis] * 0.1
+    step = pixel(unit + [0.0, 0.0, z])[axis] - base[axis]           # pixels per 0.1 world units, signed
+    world = unit * ((SIZE - 0.75 - base[axis]) / step)
+    world[2] = z
+    np.testing.assert_allclose(pixel(world)[axis], SIZE - 0.75, atol=1e-3)
+    np.testing.assert_allclose(pixel(world)[1 - axis], SIZE / 2, atol=1e-3)
+    return _splats(np.full(n, world[0]), np.full(n, world[1]), np.full(n, z), 1e-4, 0.9)
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["right-edge", "bottom-edge"])
+def test_structure_score_skips_dropped_samples_at_the_image_border(axis):
+    """A sample inside the last pixel of a fully dropped image is no observation. Its far bilinear taps fall outside
+    the image; counting those as kept let ~32% of these samples vote (keep >= 0.5 from the outside taps alone). Only
+    samples wholly outside the image (~8% here, sample sigma >= 0.55 px from the 0.3 px^2 dilation) may count."""
+    n = 512
+    counted = {}
+    for keep_value in (0.0, 1.0):
+        p = TestPipeline(device=_device(True), width=SIZE, height=SIZE, max_splats=n)
+        p.set_primitive_from_numpy(**_edge_splats(axis, n))
+        p.structure_densifier.clear_scores()
+        with p.commands.recording("score"):
+            p.rasterize(_camera())
+            p.structure_densifier.accumulate_scores(_field(p, keep_value), p.rasterizer.camera_buffer, pass_idx=0)
+        p.runtime.wait_for_idle()
+        counted[keep_value] = int(np.frombuffer(p.buffers.eta.n_total.to_numpy().tobytes(), np.uint32)[:n].sum())
+    assert counted[1.0] == n                       # the control: every splat is scored on a kept field
+    assert counted[0.0] < 0.2 * n, counted
+
+
+def _gradient_with_poisoned_render(loss: LossConfig, rgb, keep, poison: float | None):
+    """The loss gradient after the render's DROPPED pixels are overwritten with ``poison`` (None: left as rendered).
+    Nothing supervises a dropped pixel, so nothing keeps its splats finite there."""
+    p = TestPipeline(device=_device(True), width=SIZE, height=SIZE, max_splats=64, loss_config=loss)
+    p.set_primitive_from_numpy(**_cover_scene())
+    p.targets.set_image(_rgba(rgb, keep))
+    with p.commands.recording("render"):
+        p.rasterize(_camera())
+    p.runtime.wait_for_idle()
+    if poison is not None:
+        image = p.buffers.raster.output_image.to_numpy()
+        image[~keep] = poison
+        p.buffers.raster.output_image.copy_from_numpy(image)
+    with p.commands.recording("loss"):
+        p.record_loss(IterationContextualVariables(hardness_value=p.extinction_hardness,
+                                                   sh_degree=p.active_sh_degree))
+    p.runtime.wait_for_idle()
+    return p.buffers.loss.image_gradient.to_numpy().astype(np.float64)
+
+
+@pytest.mark.parametrize("poison", [np.nan, np.inf], ids=["nan", "inf"])
+@pytest.mark.parametrize("ssim", [0.0, 0.2], ids=["l1+l2", "ssim"])
+def test_non_finite_render_on_dropped_pixels_stays_out_of_the_gradient(ssim, poison):
+    """NaN * 0 is NaN: gating by multiplying with the keep mask let a non-finite dropped render reach dL_dC, and the
+    SSIM windows of kept pixels near the mask edge read it too. The L2 term is on: sign() of a non-finite difference
+    can be finite (0 for NaN on some backends), 2 * diff never is."""
+    rgb, keep = _target_rgb(), _keep_left()
+    loss = LossConfig(ssim_weight=ssim, alpha_weight=0.0, l2_weight=0.5)
+    clean = _gradient_with_poisoned_render(loss, rgb, keep, None)
+    poisoned = _gradient_with_poisoned_render(loss, rgb, keep, poison)
+    assert np.isfinite(clean).all() and np.count_nonzero(clean[keep, :3]) > 0
+    assert np.isfinite(poisoned).all()
+    assert (poisoned[~keep] == 0.0).all()
+    # Kept pixels whose gradient never reads a dropped render are untouched. L1 has no window: every kept pixel.
+    # SSIM: a pixel's gradient sums the windows centred within 5 px, each reading 5 px further, so 10 px.
+    far = np.zeros_like(keep)
+    far[:, : HALF - (10 if ssim else 0)] = True
+    np.testing.assert_array_equal(poisoned[far], clean[far])
+
+
+@pytest.mark.parametrize("case", ["masks-with-w-alpha", "no-mask-matches"])
+def test_invalid_mask_runs_fail_before_stereo_seeding(tmp_path, monkeypatch, case):
+    """--stereo-init (on by default) triangulates every training view; a run that will be refused must be refused
+    before that work, not after it."""
+    from _colmap_testkit import write_colmap_scene
+    from trainer.frontend.app import TrainingApplication
+    from trainer.frontend.cli import build_parser
+    import trainer.data.stereo as stereo
+    calls = []
+    monkeypatch.setattr(stereo, "seed_from_stereo", lambda *a, **k: calls.append(a) or 0)
+    monkeypatch.chdir(tmp_path)
+    scene = write_colmap_scene(tmp_path / "scene", views=[(f"{i}.png", 16, 16, 20.0) for i in range(4)])
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    extra = ["--w-alpha", "1.0"] if case == "masks-with-w-alpha" else []
+    if case == "masks-with-w-alpha":
+        _png(masks / "0.png", np.full((16, 16), 255, np.uint8))
+    args = build_parser().parse_args(["--scene", str(scene), "--no-viewer", "--width", "16", "--height", "16",
+                                      "--no-write-ground-truths", "--stereo-init", "--masks", str(masks), *extra])
+    app = TrainingApplication(args)
+    expected = ConfigError if case == "masks-with-w-alpha" else FileNotFoundError
+    with pytest.raises(expected):
+        app._prepare_scene(scene)
+    assert calls == []
+    # the control: a valid masked run does seed from stereo
+    _png(masks / "1.png", np.full((16, 16), 255, np.uint8))
+    args.w_alpha = 0.0
+    app._prepare_scene(scene)
+    assert len(calls) == 1

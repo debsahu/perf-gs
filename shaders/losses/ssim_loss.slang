@@ -12,6 +12,8 @@
 // dropped pixel. Edge approximation: a kept window within 5 px of the mask boundary still reads the
 // dropped pixels' rendered and target values in its mean and variance. Those pixels get no gradient,
 // so the window can only move kept pixels, but its statistics are not those of the kept set alone.
+// The gates select rather than multiply, and a non-finite dropped render reads as 0, so NaN or Inf on a
+// dropped pixel never reaches dL_dC.
 
 static const int WINDOW_RADIUS = 5;
 static const int WINDOW = 2 * WINDOW_RADIUS + 1;
@@ -77,8 +79,15 @@ void ssimComputeMaps(
         float3 x = float3(0.0), y = float3(0.0);   // zero padding
         if (insideFrame(q, frame_dim))
         {
+            float4 target_q = target_image[uint2(q)];
             x = output_image[uint2(q)].rgb;
-            y = target_image[uint2(q)].rgb;
+            y = target_q.rgb;
+#if LOSS_MASK
+            // A dropped pixel is unsupervised, so its render may be non-finite; the kept windows that overlap it
+            // read it here. Such a value reads as 0 (finite renders are unchanged).
+            if (target_q.a == 0.0 && !all(isfinite(x)))
+                x = float3(0.0);
+#endif
         }
         [unroll] for (uint c = 0; c < 3; c++)
         {
@@ -159,9 +168,10 @@ void ssimComputeMaps(
     float3 m3 = (dS_dsxy) * inv_w;
 #if LOSS_MASK
     float keep_center = target_image[p].a;   // only windows centered on kept pixels count
-    m1 *= keep_center;
-    m2 *= keep_center;
-    m3 *= keep_center;
+    bool kept_center = keep_center > 0.0;    // select, not multiply: a dropped center's maps may be non-finite
+    m1 = kept_center ? m1 * keep_center : float3(0.0);
+    m2 = kept_center ? m2 * keep_center : float3(0.0);
+    m3 = kept_center ? m3 * keep_center : float3(0.0);
 #endif
 
     ssim_m1[p] = float4(m1, 0.0);
@@ -277,7 +287,8 @@ void ssimGradient(
 
     float grad_alpha = 0.0;
 #if LOSS_MASK
-    grad_rgb *= target.a;
+    // Select, not multiply: NaN * 0 is NaN, and nothing keeps a dropped pixel's render finite.
+    grad_rgb = target.a > 0.0 ? grad_rgb * target.a : float3(0.0);
 #else
     if (w_alpha > 0.0)
         grad_alpha = w_alpha * sign(rendered.a - target.a);

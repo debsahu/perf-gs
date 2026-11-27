@@ -6,6 +6,7 @@
 #include "../common/types.slang"
 #include "../common/math.slang"
 #include "sh_carry.slang"
+#include "child_slots.slang"
 
 static const uint ACTION_KEEP  = 0;
 static const uint ACTION_SPLIT = 1;
@@ -97,7 +98,7 @@ void splitAndClone(
         Gaussian3D c1 = _child_for_split(parent, i * 2u);
         Gaussian3D c2 = _child_for_split(parent, i * 2u + 1u);
 
-        uint tail = pre_count + child_offset[i];
+        uint tail = tailStart(pre_count, child_offset[i], max_splats);
         if (tail >= max_splats)
         {
             action[i] = ACTION_KEEP;
@@ -112,7 +113,7 @@ void splitAndClone(
     {
         Gaussian3D clone = parent;
 
-        uint tail = pre_count + child_offset[i];
+        uint tail = tailStart(pre_count, child_offset[i], max_splats);
         if (tail < max_splats)
         {
             gaussians[tail] = clone;
@@ -150,7 +151,7 @@ void splitAndCloneSH(
         Gaussian3D c1 = _child_for_split(parent, i * 2u);
         Gaussian3D c2 = _child_for_split(parent, i * 2u + 1u);
 
-        uint tail = pre_count + child_offset[i];
+        uint tail = tailStart(pre_count, child_offset[i], max_splats);
         if (tail >= max_splats)
         {
             action[i] = ACTION_KEEP;
@@ -168,7 +169,7 @@ void splitAndCloneSH(
     {
         Gaussian3D clone = parent;
 
-        uint tail = pre_count + child_offset[i];
+        uint tail = tailStart(pre_count, child_offset[i], max_splats);
         if (tail < max_splats)
         {
             gaussians[tail] = clone;

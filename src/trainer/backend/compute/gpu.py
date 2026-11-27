@@ -22,6 +22,45 @@ def marker_color(name: str) -> tuple[float, float, float]:
     return tuple(0.35 + (b / 255.0) * 0.65 for b in digest)  # type: ignore[return-value]
 
 
+class BindingError(TypeError):
+    """A dispatch's keyword arguments do not match its entry point's parameters."""
+
+
+_BINDINGS: dict[int, tuple[frozenset[str], frozenset[str], str]] = {}
+
+
+def entry_point_bindings(kernel) -> tuple[frozenset[str], frozenset[str]]:
+    """(required, all) parameter names of the kernel's entry point. System values (scalar or
+    vector parameters that take no uniform space, e.g. SV_DispatchThreadID) are not bindable."""
+    cached = _BINDINGS.get(id(kernel))
+    if cached is None or cached[2] is not kernel:
+        ep = kernel.program.layout.entry_points[0]
+        names, required = set(), set()
+        for i in range(len(ep.parameters)):
+            param = ep.parameters[i]
+            layout = param.type_layout
+            system = (layout.kind in (spy.TypeReflection.Kind.scalar, spy.TypeReflection.Kind.vector)
+                      and layout.size == 0)
+            if not system:
+                required.add(param.name)
+            names.add(param.name)
+        cached = (frozenset(required), frozenset(names), kernel)
+        _BINDINGS[id(kernel)] = cached
+    return cached[0], cached[1]
+
+
+def check_bindings(kernel, marker: str, kwargs: dict) -> None:
+    """Raise BindingError when kwargs miss a parameter or name one the entry point lacks:
+    Slang would leave a missing one zero and silently ignore an extra one."""
+    required, names = entry_point_bindings(kernel)
+    given = set(kwargs) - {"thread_count"}
+    missing, extra = required - given, given - names
+    if missing or extra:
+        entry = kernel.program.layout.entry_points[0].name
+        raise BindingError(f"dispatch {marker!r} ({entry}): "
+                           f"missing {sorted(missing)}, not parameters {sorted(extra)}")
+
+
 @dataclass(frozen=True)
 class SubmitHandle:
     """A submitted command buffer; wait on it to bound queue depth without a full device idle."""
@@ -40,6 +79,7 @@ class CommandBatch:
         return self._encoder
 
     def dispatch(self, kernel, marker: str, **kwargs) -> None:
+        check_bindings(kernel, marker, kwargs)
         self._encoder.insert_debug_marker(marker, spy.math.float3(*marker_color(marker)))
         kernel.dispatch(command_encoder=self._encoder, **kwargs)
 
@@ -49,6 +89,7 @@ class CommandBatch:
 
         No barrier before the fetch: sgl's resource tracking covers the ``args_buf`` write.
         """
+        check_bindings(kernel, marker, kwargs)
         self._encoder.insert_debug_marker(marker, spy.math.float3(*marker_color(marker)))
         pass_enc = self._encoder.begin_compute_pass()
         try:

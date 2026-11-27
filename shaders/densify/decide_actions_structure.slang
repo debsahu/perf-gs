@@ -3,6 +3,7 @@
 #include "../common/types.slang"
 #include "../common/math.slang"
 #include "blend_weight.slang"
+#include "child_slots.slang"
 
 static const uint ACTION_KEEP  = 0;
 static const uint ACTION_SPLIT = 1;
@@ -88,7 +89,7 @@ void decideActionsStructure(
         nkx = per_axis_split_factor(eta_x, split_power, max_split_factor);
         nky = per_axis_split_factor(eta_y, split_power, max_split_factor);
         nkz = per_axis_split_factor(eta_z, split_power, max_split_factor);
-        uint prod = nkx * nky * nkz;
+        uint prod = gridSize(nkx, nky, nkz);   // saturating: a 2**32 grid must not read as 0
 
         bool is_small = (max_scale <= dense_scale);
         if (is_small || prod <= 1u)
@@ -109,7 +110,7 @@ void decideActionsStructure(
 
     // The requested growth only feeds the overbudget report: an integer sum, so its order
     // does not matter. The parent list is built in index order by allocate_children.slang.
-    uint requested = out_action == ACTION_SPLIT ? nkx * nky * nkz - 1u
+    uint requested = out_action == ACTION_SPLIT ? gridSize(nkx, nky, nkz) - 1u
                    : (out_action == ACTION_CLONE ? 1u : 0u);
     uint wave_growth = WaveActiveSum(requested);
     if (WaveIsFirstLane() && wave_growth > 0u)

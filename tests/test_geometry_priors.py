@@ -802,4 +802,3 @@ def test_ssi_means_resolve_small_disparities():
     assert stats["ssi_a"] == pytest.approx(a_true, rel=0.003)
     assert stats["ssi_b"] == pytest.approx(b_true, rel=0.003)
     assert np.isfinite(gpu).all()
-

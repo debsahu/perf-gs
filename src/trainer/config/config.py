@@ -211,6 +211,10 @@ class DensifyConfig:
     # True: scale opacity by reset_decay (SADGS, keeps the ordering); False: clamp (gsplat).
     reset_relative: bool = False
     reset_decay: float = 0.1
+    # Which parents get their children when the cap binds: "hash" = a spatially uniform subset (hash of
+    # index, tick and seed), "index" = the lowest indices (clusters in the low Morton range).
+    cap_order: str = "hash"
+    cap_seed: int = 0
 
 
 @dataclass
@@ -227,6 +231,8 @@ class StructureConfig:
     split_power: float = 0.5         # 0.5 = sqrt (paper)
     # Per-axis cap on n_k. SADGS uses 8 (max_clones_per_axis); 2 trains 17% faster for 0.04 dB.
     max_split_factor: int = 2
+    cap_order: str = "hash"          # see DensifyConfig.cap_order; for the ranked cutoff bin too
+    cap_seed: int = 0
     # Child scale sigma_k / n_k**power: 1.0 for Mip-NeRF 360, 1.2 for T&T / Deep Blending (SADGS).
     ks_scale_power: float = 1.0
     t_opacity: float = 0.005

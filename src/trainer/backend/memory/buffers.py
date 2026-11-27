@@ -247,6 +247,7 @@ class DensificationResources:
     actions: spy.NDBuffer
     valid_mask: spy.NDBuffer
     child_offset: spy.NDBuffer        # per-parent tail offset (an exclusive prefix sum) at a densify tick
+    cap_histogram: spy.NDBuffer       # cap-full hash thinning: 256 cost bins, 256 overflow flags, cutoff, budget
     pre_count: spy.NDBuffer
     post_count: spy.NDBuffer
     dispatch_args: spy.NDBuffer
@@ -571,6 +572,7 @@ def allocate(
         actions=actions,
         valid_mask=valid_mask,
         child_offset=allocator.uint_buffer("densification.child_offset", max_splats),
+        cap_histogram=allocator.uint_buffer("densification.cap_histogram", 2 * 256 + 2),
         pre_count=allocator.uint_buffer("densification.pre_count", 1),
         post_count=allocator.uint_buffer("densification.post_count", 1),
         dispatch_args=allocator.indirect_buffer("densification.dispatch_args"),

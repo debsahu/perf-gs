@@ -120,3 +120,41 @@ def test_a_system_value_or_an_indirect_thread_count_is_not_a_binding():
         gpu.check_bindings(kernel, "m", {"buf": 1, "dtid": 0})
     with pytest.raises(BindingError, match="thread_count"):
         gpu.check_bindings(kernel, "m", {"buf": 1, "thread_count": [1, 1, 1]}, indirect=True)
+
+
+def test_every_dispatch_binds_with_masks_priors_and_stbn_compiled_in() -> None:
+    """LOSS_MASK, GEOM_PRIORS and STBN_ENABLED together change the arguments of the loss, forward and both blend
+    backwards: a full training step (dense STBN, every geometry term on) must bind every dispatch exactly."""
+    from trainer.backend.compute.device import create_device
+    from trainer.config.config import GeometryConfig, LossConfig, StbnConfig
+    from _pipeline_testkit import TestPipeline
+    from trainer.data.dataset import simple_camera
+    device = create_device(backend="vulkan", defines={"LOSS_MASK": "1", "GEOM_PRIORS": "1", "STBN_ENABLED": "1"})
+    try:
+        for per_bucket in (False, True):
+            p = TestPipeline(device=device, width=16, height=16, max_splats=64,
+                             loss_config=LossConfig(ssim_weight=0.2),
+                             geometry_config=GeometryConfig(depth_weight=1.0, normal_weight=0.2,
+                                                            depth_normal_weight=0.05, flatten_weight=1.0),
+                             stbn_config=StbnConfig(backward_compacted=True), use_flat_bucket_backward=per_bucket)
+            assert p.loss_mask and p.geom_priors
+            rng = np.random.default_rng(1)
+            n = 16
+            p.set_primitive_from_numpy(
+                means=np.column_stack([rng.uniform(-0.5, 0.5, (n, 2)), np.full(n, 3.0)]).astype(np.float32),
+                log_scales=np.log(np.full((n, 3), 0.2, np.float32)),
+                rot_quats=np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1)),
+                opacities=np.full(n, 0.7, np.float32), color_logits=np.zeros((n, 3), np.float32))
+            rgba = np.ones((16, 16, 4), np.float32)
+            rgba[:, :8, 3] = 0.0
+            p.targets.set_image(rgba)
+            p.geometry.set_prior_grids((16, 16), (16, 16))
+            normal = np.zeros((16, 16, 4), np.uint8)
+            normal[..., :2], normal[..., 3] = 128, 255
+            p.geometry.select(np.full((16, 16), 3000, np.uint16), normal)
+            cam = simple_camera(width=16, height=16, eye=(0.0, 0.0, 0.0), target=(0.0, 0.0, 1.0))
+            p.train_step(cam)                                # every dispatch passes the binding guard
+            p.runtime.wait_for_idle()
+            assert p.geometry.read_stats()["V_d"] > 0
+    finally:
+        device.close()

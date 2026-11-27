@@ -655,3 +655,104 @@ def test_requested_children_saturate_past_32_bits(gpu_device) -> None:
     result = _densify_structure(p, max_split_factor=2048, split_power=1.0)
     assert result["requested_children"] == 0xFFFFFFFF
     assert result["overbudget"] is True
+
+
+# ---------------------------------------------------------------- blind spots of the review
+
+def test_ranked_hash_cutoff_admits_the_cpu_hash_set(gpu_device) -> None:
+    """Ranked, every parent in one priority bin at cost 1: the cutoff bin is admitted in hash order, so exactly the
+    parents the CPU hash reference admits split, at a nonzero tick and seed."""
+    n, room, tick, seed = 6000, 2500, 900, 3
+    p = _setup(gpu_device, max_splats=n + room)
+    _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+    _one_axis(p)
+    p.structure_densifier.densify(StructureConfig(opacity_cap=0, dense_scale=0.05, rank_split_families=True,
+                                                  cap_order="hash", cap_seed=seed), tick=tick)
+    split = _u32(p.buffers.densification.actions, n) == 1
+    want = _hash_admitted(np.ones(n, np.int64), room, tick, seed)
+    assert want.sum() == room and not np.array_equal(want, np.arange(n) < room)   # not the index order
+    np.testing.assert_array_equal(split, want)
+    assert _count(p) == n + room
+
+
+def test_hash_thinning_with_prunes(gpu_device) -> None:
+    """Pruned splats ask for nothing and are removed; hash thinning admits the reference set over the rest, and
+    the compacted count is the survivors plus the admitted growth."""
+    n, cap, tick = 4000, 7000, 300
+    roomy = _setup(gpu_device, max_splats=40_000)
+    _population(roomy, n, seed=5)
+    pruned = np.zeros(n, bool)
+    pruned[::7] = True
+
+    def faint(p):
+        g = _read_gaussians(p, n)
+        op = np.full(n, 0.7, np.float32)
+        op[pruned] = 0.001                                  # under t_opacity 0.005: pruned
+        p.set_primitive_from_numpy(means=g[:, :3].copy(), log_scales=g[:, 3:6].copy(),
+                                   rot_quats=np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1)),
+                                   opacities=op, color_logits=np.zeros((n, 3), np.float32))
+    # _population sets the accumulators; re-setting the primitives keeps them
+    faint(roomy)
+    _densify_structure(roomy, cap_order="index")
+    actions = _u32(roomy.buffers.densification.actions, n)
+    assert (actions[pruned] == 3).all()
+    cost = _growth(roomy, n, actions_before=actions)
+    assert (cost[pruned] == 0).all() and n + cost.sum() > cap
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, n, seed=5)
+    faint(p)
+    p.structure_densifier.densify(StructureConfig(opacity_cap=0, dense_scale=0.05, cap_order="hash"), tick=tick)
+    actions = _u32(p.buffers.densification.actions, n)
+    want = _hash_admitted(cost, cap - n, tick, 0)
+    assert (actions[pruned] == 3).all()
+    got = (actions == 1) | (actions == 2) | (cost == 0)
+    np.testing.assert_array_equal(got, want)
+    assert _count(p) == n - pruned.sum() + int(cost[want & (cost > 0)].sum())
+
+
+def test_simple_hash_thinning_carries_eta(gpu_device) -> None:
+    """The simple densifier over the cap with --cap-order hash and carry_eta: the hash reference set clones, every
+    parent (kept or cloned) carries its eta to its compacted slot, and the new children start at zero."""
+    n, room, tick = 2000, 500, 77
+    p = _setup(gpu_device, max_splats=n + room)
+    _simple_population(p, n, seed=8)
+    grad = np.zeros(p.max_splats, np.int64)
+    grad[:n] = 65536 * 1000
+    p.buffers.densification.grad_mean_2d_mag.copy_from_numpy(grad)
+    small = np.full(n, 0.01, np.float32)
+    g = _read_gaussians(p, n)
+    p.set_primitive_from_numpy(means=g[:, :3].copy(), log_scales=np.log(np.repeat(small[:, None], 3, axis=1)),
+                               rot_quats=np.tile(np.array([1, 0, 0, 0], np.float32), (n, 1)),
+                               opacities=np.full(n, 0.7, np.float32), color_logits=np.zeros((n, 3), np.float32))
+    p.buffers.densification.grad_mean_2d_mag.copy_from_numpy(grad)
+    eta = np.zeros(p.max_splats, np.uint32)
+    eta[:n] = np.arange(1, n + 1)
+    p.buffers.eta.n_total.copy_from_numpy(eta)
+    p.simple_densifier.run(DensifyConfig(cap_order="hash"), grad_thresh=0.0002, scale_thresh=10.0,
+                           allow_scale_prune=False, carry_eta=True, tick=tick)
+    assert _count(p) == n + room
+    owners = np.rint(_read_gaussians(p, n + room)[n:, 0] / SPACING).astype(int)
+    want = _hash_admitted(np.ones(n, np.int64), room, tick, 0)
+    np.testing.assert_array_equal(owners, np.flatnonzero(want))
+    carried = _u32(p.buffers.eta.n_total, n + room)
+    np.testing.assert_array_equal(carried[:n], np.arange(1, n + 1))
+    assert (carried[n:] == 0).all()
+
+
+def test_ranked_histogram_overflow_admits_nothing_it_cannot_place(gpu_device) -> None:
+    """69,000 identical parents each asking for 65,535 children put 4.5e9 in one priority bin: the counter wraps,
+    the bin's overflow flag is set, and the cutoff treats the bin as not fitting instead of reading the wrapped
+    count as room. A smaller population (60,000, 3.9e9) does not overflow: the control."""
+    flags = {}
+    for n in (69_000, 60_000):
+        cap = 70_000
+        p = _setup(gpu_device, max_splats=cap)
+        _population(p, n, seed=2, clone_fraction=0, keep_fraction=0, eta_choices=(1.5,))
+        _set_axis_eta(p, cap, [(65535.99, 1.0, 1.0)] * n)
+        _densify_structure(p, rank_split_families=True, max_split_factor=65536, split_power=1.0)
+        hist = _u32(p._raster_resources.depth_sort.global_hist.storage if hasattr(p, "_raster_resources")
+                    else p.buffers.raster.depth_sort.global_hist, 514)
+        flags[n] = int(hist[256:512].sum())
+        assert _count(p) == n                               # room 1,000-10,000 < 65,535: no family fits
+        assert (_u32(p.buffers.densification.actions, n) == 0).all()
+    assert flags == {69_000: 1, 60_000: 0}, flags

@@ -345,16 +345,18 @@ def test_small_device_buffers_pass_the_storage_range_guard(device, monkeypatch) 
         StbnMask.from_table(device, np.zeros(8, np.uint32), spec)
 
 
+@pytest.mark.parametrize("densify", [False, True], ids=["fixed", "densify"])
 @pytest.mark.parametrize("masks,priors", [(False, False), (True, False), (False, True), (True, True)],
                          ids=["plain", "masked", "priors", "masked-priors"])
-def test_compressed_training_matches_stream(device, tmp_path, monkeypatch, masks, priors) -> None:
+def test_compressed_training_matches_stream(device, tmp_path, monkeypatch, masks, priors, densify) -> None:
     """A real run in compressed residency (decode cache, prefetch window, packer, upload) trains the same splats as
-    the stream residency, bit for bit. Densification is off: before deterministic densify, two runs of one residency
-    already differ once it runs, so a difference would not be the residency's."""
+    the stream residency, bit for bit, with structure-aware densification on too: child slots come from prefix
+    sums, so a run repeats exactly and any difference is the residency's."""
     monkeypatch.chdir(tmp_path)
-    run = dict(masks=masks, priors=priors, visible=True, iters=40, densify=False)
+    run = dict(masks=masks, priors=priors, visible=True, iters=40, densify=densify)
     streamed = _train_scene(device, tmp_path, monkeypatch, "stream", **run)
     seed = _train_scene.seed
     compressed = _train_scene(device, tmp_path, monkeypatch, "compressed", **run)
     assert not np.array_equal(streamed, seed[:len(streamed)])     # the run trained: the splats moved
+    assert (len(streamed) > 64) == densify                         # and densified past the 64 seed points
     np.testing.assert_array_equal(streamed, compressed)

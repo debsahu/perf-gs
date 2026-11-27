@@ -754,3 +754,52 @@ def test_flatten_with_the_per_pixel_backward_is_refused():
     with pytest.raises(RuntimeError, match="per-splat backward"):
         _pipeline(_device(), GeometryConfig(flatten_weight=1.0), use_persplat_backward=False,
                   use_flat_bucket_backward=False)
+
+
+def _ssi_frame(D, depth_mm, units_per_meter=1.0):
+    w, h = D.shape[1], D.shape[0]
+    A = np.full((h, w), 0.9, np.float32)
+    F = np.zeros((h, w, 4), np.float32)
+    F[..., 2] = -0.9
+    F[..., 3] = A * D
+    cfg = GeometryConfig(depth_weight=1.0, depth_space="ssi", units_per_meter=units_per_meter)
+    p = _pipeline(_device(GEOM_PRIORS=True), cfg, w=w, h=h)
+    return _run_loss(p, _camera(w, h, 60.0), F, A, depth_mm, None)
+
+
+def test_ssi_fit_refuses_a_narrow_depth_spread():
+    """Depths over 98-100 m (2%) cannot pin a slope and an offset: the frame is skipped and counted."""
+    w = h = 32
+    u, _ = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
+    D = 98.0 + 2.0 * u
+    x = (1.0 / D + 0.0078) / 0.8                          # a = 0.8, b = -0.0078: priors ~ 44-45 m
+    mm = np.rint(1000.0 / x)
+    assert 1000 < mm.min() and mm.max() < 65535            # in the uint16 mm range (no wrap)
+    depth = mm.astype(np.uint16)
+    rel_var = np.var(x) / np.mean(x) ** 2
+    assert 0 < rel_var < 1e-3                             # the fixture really sits under the gate
+    gpu, stats = _ssi_frame(D, depth)
+    assert stats["V_d"] == w * h and stats["skipped_frames"] == 1
+    assert np.count_nonzero(gpu) == 0
+
+
+def test_ssi_means_resolve_small_disparities():
+    """Pins the 2^24 scale of the disparity means. Two depth plateaus whose disparities (scene units per metre
+    0.01: y = 1e-4 and 2.5e-4 per m) round by up to ~7% at a 2^16 scale, where b then misses by 1.1%; a and b
+    must come out within 0.3% (measured: 0.01% and 0.05%)."""
+    w = h = 32
+    a_true, b_true, U = 0.008, -4e-5, 0.01
+    D = np.where(np.arange(w)[None, :] < w // 2, 100.0, 40.0) * np.ones((h, 1))     # scene units
+    y = U / D
+    x = (y - b_true) / a_true                             # prior disparity, 1/m: 57 m and 27.6 m
+    mm = np.rint(1000.0 / x)
+    assert 1000 < mm.min() and mm.max() < 65535
+    depth = mm.astype(np.uint16)
+    coarse = np.abs(np.rint(y * 65536) / 65536 - y) / y   # what a 2^16 scale would make of each mean
+    assert coarse.max() > 0.05
+    gpu, stats = _ssi_frame(D, depth, units_per_meter=U)
+    assert stats["V_d"] == w * h and stats["skipped_frames"] == 0
+    assert stats["ssi_a"] == pytest.approx(a_true, rel=0.003)
+    assert stats["ssi_b"] == pytest.approx(b_true, rel=0.003)
+    assert np.isfinite(gpu).all()
+

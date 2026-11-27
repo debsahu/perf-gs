@@ -105,7 +105,7 @@ def supervision(f: Frame, s: Settings):
         x = 1.0 / f.Dg[depth]
         y = s.U / D[depth]
         vxx = np.mean(x * x) - np.mean(x) ** 2
-        if depth.sum() >= 16 and vxx > 1e-12:
+        if depth.sum() >= 16 and vxx / np.mean(x) ** 2 > 1e-3:      # relative variance gate
             a = (np.mean(x * y) - np.mean(x) * np.mean(y)) / vxx
             ab = (a, np.mean(y) - a * np.mean(x))
         else:

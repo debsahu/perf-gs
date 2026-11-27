@@ -51,6 +51,9 @@ static const float PLANE_MAX_DEPTH = 1e4;
 static const float NORMAL_MIN_LEN2 = 1e-12;
 static const float CROSS_MIN_LEN = 1e-12;
 static const uint SSI_MIN_PIXELS = 16u;
+// The prior's disparities must spread by more than this relative variance (std ~3%): a frame whose depths
+// span ~2% (98-100 m) cannot pin a slope and an offset, so its depth term is skipped and counted.
+static const float SSI_MIN_REL_VARIANCE = 1e-3;
 static const float SSI_MEAN_SCALE = 16777216.0;   // 2^24: x up to 1000 (1 mm) over 24 Mpx stays in int64
 
 int64_t statFixed(float value, float scale) { return int64_t(round(value * scale)); }
@@ -528,7 +531,7 @@ void geomGrad(
         float a = (mx > 0.0 && var_r > 0.0) ? (my / mx) * cov_r / var_r : 0.0;
         // Degenerate (too few pixels, no spread) or inverted (a <= 0: prior and render disagree in order)
         // fits skip the frame's depth term; they are counted.
-        if (Vd < float(SSI_MIN_PIXELS) || !(var_r > 1e-8) || !(a > 0.0) || isinf(a) || isnan(a))
+        if (Vd < float(SSI_MIN_PIXELS) || !(var_r > SSI_MIN_REL_VARIANCE) || !(a > 0.0) || isinf(a) || isnan(a))
             depth_frame = false;
         else
         {

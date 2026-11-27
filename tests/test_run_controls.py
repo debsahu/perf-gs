@@ -49,6 +49,9 @@ class _Pipeline:
         self.rendered.append(camera)
         self.on_render(len(self.rendered))
 
+    def allocated_bytes(self) -> dict[str, int]:
+        return {}
+
     def read_output_image(self) -> np.ndarray:
         return np.full((16, 16, 4), 0.25, dtype=np.float32)
 

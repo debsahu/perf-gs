@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-language fixture for normals_from_depth. Consumed by ingest/lidar_priors/scripts/tests/test_normals_from_depth.py (Python) and intended for the matching brush-loss unit test in the Brush fork (Rust). Regenerate with ingest/lidar_priors/scripts/make_fixture.py and copy to BOTH repos. Camera frame is OpenCV (+X right, +Y down, +Z forward); u,v are INTEGER pixel indices; differences are FORWARD; invalid pixels are exactly (0,0,0). ORIENTATION: a camera-facing normal satisfies dot(n, r) <= 0 against THAT PIXEL'S view ray r = ((u-cx)/fx, (v-cy)/fy, 1) -- NOT n.z <= 0, which holds only on the optical axis. Case 2 exists to separate the two.",
+  "_comment": "Fixture for normals_from_depth, consumed here by tests/test_geometry_priors.py (geomNormalFromDepthTest). It is a cross-language fixture: keep any copy elsewhere byte-identical. Camera frame is OpenCV (+X right, +Y down, +Z forward); u,v are INTEGER pixel indices; differences are FORWARD; invalid pixels are exactly (0,0,0). ORIENTATION: a camera-facing normal satisfies dot(n, r) <= 0 against THAT PIXEL'S view ray r = ((u-cx)/fx, (v-cy)/fy, 1) -- NOT n.z <= 0, which holds only on the optical axis. Case 2 exists to separate the two.",
   "schema_version": "2.0",
   "invalid_normal": [
     0.0,

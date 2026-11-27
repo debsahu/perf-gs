@@ -33,10 +33,11 @@ static const uint GS_LN = 10u;   // sum of the normal error (L1 per pixel summed
 static const uint GS_LDN = 11u;  // sum of 1 - cos(depth normal, rendered normal)
 static const uint GS_SSI_A = 12u; // the frame's fitted (a, b) as float bits in .x (logging and tests)
 static const uint GS_SSI_B = 13u;
-static const uint GS_PER_STEP = 14u;
-static const uint GS_SKIPPED = 14u;      // frames whose scale-shift fit was degenerate (cumulative)
-static const uint GS_DEPTH_FRAMES = 15u; // frames with the depth term evaluated (cumulative)
-static const uint GEOM_STATS_SLOTS = 16u;
+static const uint GS_DEPTH_ON = 14u;     // 1 when this step's depth term ran (a skipped fit still counts V_d)
+static const uint GS_PER_STEP = 15u;
+static const uint GS_SKIPPED = 15u;      // frames whose scale-shift fit was degenerate (cumulative)
+static const uint GS_DEPTH_FRAMES = 16u; // frames with the depth term evaluated (cumulative)
+static const uint GEOM_STATS_SLOTS = 17u;
 
 static const uint DEPTH_SPACE_DISPARITY = 0u;
 static const uint DEPTH_SPACE_METRIC = 1u;
@@ -44,10 +45,13 @@ static const uint DEPTH_SPACE_SSI = 2u;
 
 static const uint DEPTH_CODE_SATURATED = 65535u;   // >= 65.535 m: skipped as invalid
 
-// Plane-depth validity (as PGSR-style renderers use): enough coverage, not edge-on, in range.
+// Depth validity (as PGSR-style renderers use): enough coverage, not edge-on (plane), and in range. The range is
+// in METRES (depth / units_per_meter), so it means the same in a millimetre or a kilometre scene. The 1 mm floor
+// (both sources) bounds every disparity U / D to 1000 / m, which keeps the fixed-point sums below in int64; the
+// 10 km ceiling is plane depth's only.
 static const float PLANE_MIN_DOT = 0.05;
-static const float PLANE_MIN_DEPTH = 1e-3;
-static const float PLANE_MAX_DEPTH = 1e4;
+static const float DEPTH_MIN_M = 1e-3;
+static const float DEPTH_MAX_M = 1e4;
 static const float NORMAL_MIN_LEN2 = 1e-12;
 static const float CROSS_MIN_LEN = 1e-12;
 static const uint SSI_MIN_PIXELS = 16u;
@@ -82,22 +86,20 @@ void resolvePixel(uint2 q, RWTexture2D<float4> aux_image, RWTexture2D<float4> ou
     float n2 = dot(F.xyz, F.xyz);
     if (n2 > NORMAL_MIN_LEN2)
         nh = F.xyz * rsqrt(n2);
+    float d = 0.0;
     if (f.plane_depth != 0u)
     {
         float den = dot(F.xyz, r);
         if (abs(den) >= PLANE_MIN_DOT)
-        {
-            float d = F.w / den;
-            if (d >= PLANE_MIN_DEPTH && d <= PLANE_MAX_DEPTH)
-                D = d;
-        }
+            d = F.w / den;
     }
     else
-    {
-        float d = F.w / A;
-        if (d > 0.0 && !isinf(d) && !isnan(d))
-            D = d;
-    }
+        d = F.w / A;
+    // Center depth had no upper bound and keeps none (a finite one is enough); plane depth keeps its 10 km cap.
+    float dm = d / f.units_per_meter;
+    bool below_max = (f.plane_depth != 0u) ? dm <= DEPTH_MAX_M : !isinf(dm);
+    if (dm >= DEPTH_MIN_M && below_max)                  // false for NaN too
+        D = d;
 }
 
 float maskAt(uint2 q
@@ -142,7 +144,8 @@ float3 priorNormal(uint2 p, Texture2D<uint4> normal_prior, GeomFrame f)
     // A target must be (near) unit length: 0.7 <= |g| <= 1.3. Anything else is a sentinel or a misread
     // encoding (a black pixel of a spirula map read as slam decodes to (-1, -1, -1), length 1.73).
     float l2 = dot(g, g);
-    return (l2 >= 0.49 && l2 <= 1.69) ? g : float3(0.0);
+    // Normalised: 8-bit codes are up to ~1% off unit length, and 1 - dot(nh, g) must not go below 0.
+    return (l2 >= 0.49 && l2 <= 1.69) ? g * rsqrt(l2) : float3(0.0);
 }
 
 // Whether the depth-normal term centered at q is supervised, from the resolved values at q,
@@ -543,6 +546,7 @@ void geomGrad(
     {
         if (depth_frame) geomAtomicAdd(geom_stats, GS_DEPTH_FRAMES, int64_t(1));
         else geomAtomicAdd(geom_stats, GS_SKIPPED, int64_t(1));
+        geom_stats[GS_DEPTH_ON] = uint2(depth_frame ? 1u : 0u, 0u);
         geom_stats[GS_SSI_A] = uint2(asuint(ssi_a), 0u);
         geom_stats[GS_SSI_B] = uint2(asuint(ssi_b), 0u);
     }

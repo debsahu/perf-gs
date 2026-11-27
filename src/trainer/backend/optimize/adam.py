@@ -53,6 +53,9 @@ class AdamOptimizer:
         self._capacity = capacity
         self._pixels = float(width * height)
         self.step_count = 0
+        # 64-bit gradient seeds kept outside GradientResources (the geometry terms' grad_geom_*): zero_grad clears
+        # them with the rest.
+        self.extra_gradients: tuple = ()
 
     def reset(self) -> None:
         self.step_count = 0
@@ -130,4 +133,9 @@ class AdamOptimizer:
             self._commands.dispatch(self._k.clear_grad, "grad_clear",
                 thread_count=[self._capacity, 1, 1],
                 grad_buffer=buffer.storage,
+                max_splats=self._capacity)
+        for buffer in self.extra_gradients:
+            self._commands.dispatch(self._k.clear_grad, "grad_clear",
+                thread_count=[self._capacity, 1, 1],
+                grad_buffer=buffer,
                 max_splats=self._capacity)

@@ -333,9 +333,12 @@ def _forward(p, cam):
 
 
 def _blend_only(p):
+    """The blend backward alone, with the dense (disabled) STBN arguments the pipeline itself passes: the
+    live-bucket compaction always takes them, and the compacted backward does when STBN_ENABLED is compiled in."""
     tracking = {"blend_weight_accum": p.buffers.densification.blend_weight.storage,
                 "track_blend_weight": 0, "track_screen_grad": 1, **p.loss_mask_kwargs()}
-    p.backward._record_blend({}, {}, tracking, 1.0)
+    stbn = p._stbn_kwargs(None)
+    p.backward._record_blend(stbn, stbn if p.backward._stbn_compacted else {}, tracking, 1.0)
     p.runtime.wait_for_idle()
 
 
@@ -448,12 +451,12 @@ def test_feature_chain_matches_host_finite_differences(source):
     # backward: seeds dL/df, host FD of dot(seed, f)
     rng = np.random.default_rng(2)
     seed = rng.normal(size=(3, 4))
+    p.optimizer.zero_grad()                              # zeroes the parameter gradients and the geometry seeds
     for c, name in enumerate(SEED_NAMES):
         fixed = np.zeros(p.max_splats, np.int64)
         fixed[:3] = np.trunc(seed[:, c] * FIXED_SCALE).astype(np.int64)
         p.geometry.seeds[name].copy_from_numpy(fixed.view(np.uint32))
         seed[:, c] = fixed[:3] / FIXED_SCALE
-    p.optimizer.zero_grad()
     p.geometry.record_backward(gaussians=p.buffers.primitive.values.storage,
                                active_count=p.buffers.primitive.active_count.storage,
                                camera=p.rasterizer.camera_buffer,
@@ -574,15 +577,17 @@ def test_forward_with_geometry_is_bit_identical_to_without():
 
 
 def test_viewer_pipeline_renders_with_the_define_on():
-    """R11: a render-only pipeline binds the geometry buffers when GEOM_PRIORS is compiled in."""
+    """R11: a render-only pipeline binds the geometry arguments when GEOM_PRIORS is compiled in (a one-element
+    stub it never composites into: the viewer does not read it)."""
     from trainer.backend.render.pipeline import TrainingPipeline
     p = TrainingPipeline(_device(GEOM_PRIORS=True), W, H, max_splats=16, viewer_only=True)
-    assert p.geometry_forward is not None
+    assert p.geometry_forward is not None and p.geometry_forward.stub
+    p.geometry_forward.aux_image.copy_from_numpy(np.full((1, 1, 4), 9.0, np.float32))
     p.set_gaussians(**{k: v for k, v in _scene().items()})
     p.render(_camera(fov=60.0))
     img = p.read_output_image()
     assert img[..., 3].max() > 0.1
-    assert np.abs(p.geometry_forward.aux_image.to_numpy()).max() > 0
+    assert (p.geometry_forward.aux_image.to_numpy() == 9.0).all()
 
 
 def test_train_steps_run_and_the_terms_change_the_result():
@@ -802,3 +807,236 @@ def test_ssi_means_resolve_small_disparities():
     assert stats["ssi_a"] == pytest.approx(a_true, rel=0.003)
     assert stats["ssi_b"] == pytest.approx(b_true, rel=0.003)
     assert np.isfinite(gpu).all()
+
+
+# ------------------------------------------------------------------------------------ review regressions
+
+def _scaled_case(rng, plane: bool, depth_scale: float, units_per_meter: float, **cfg):
+    """The T1 frame with every rendered depth multiplied by ``depth_scale`` (scene units), its priors in metres
+    (depth / units_per_meter), and the GPU and float64-reference results of all three terms."""
+    cam, rays, F, A, z, n = _synthetic_frame(rng, plane)
+    F = F.copy()
+    F[..., 3] *= depth_scale
+    depth, normal = _priors(rng, z * depth_scale / units_per_meter, n)
+    config = GeometryConfig(depth_weight=1.0, normal_weight=0.2, depth_normal_weight=0.05,
+                            depth_source="plane" if plane else "center", units_per_meter=units_per_meter, **cfg)
+    p = _pipeline(_device(GEOM_PRIORS=True), config)
+    gpu, stats = _run_loss(p, cam, F, A, depth, normal)
+    s = ref.Settings(plane=plane, U=units_per_meter)
+    fd, sets = ref.fd_gradient(_reference_frame(rays, F, A, depth, normal, None), s)
+    return gpu, stats, fd, sets
+
+
+@pytest.mark.parametrize("plane", [True, False], ids=["plane", "center"])
+@pytest.mark.parametrize("depth_scale,units", [(1e4, 1000.0), (3e-4, 1e-3)], ids=["mm-scene-20m", "km-scene-0.6m"])
+def test_depth_validity_range_is_in_metres(plane, depth_scale, units):
+    """The 1 mm .. 10 km validity range of a rendered depth is in metres, not scene units: 20 m in a millimetre
+    scene is 20,000 units, and 0.6 m in a kilometre scene is 0.0006 units; both are valid depths."""
+    gpu, stats, fd, sets = _scaled_case(np.random.default_rng(7), plane, depth_scale, units)
+    assert sets["depth"].sum() > 0 and sets["dn"].sum() > 0
+    assert (stats["V_d"], stats["V_dn"]) == (int(sets["depth"].sum()), int(sets["dn"].sum()))
+    assert np.isfinite(gpu).all() and _rel_err(gpu, fd) < T1_TOL
+
+
+def test_center_depth_below_a_millimetre_is_not_supervised():
+    """Center depth had no range check: a splat a fraction of a millimetre from the camera entered the disparity
+    sums (U / D) unbounded, which can overflow the int64 fixed point. It is now invalid, as in plane mode."""
+    rng = np.random.default_rng(7)
+    cam, rays, F, A, z, n = _synthetic_frame(rng, plane=False)
+    F = F.copy()
+    F[..., 3] *= 2e-4                                   # D ~ 0.4 mm at U = 1
+    depth, normal = _priors(rng, z, n)                  # the priors still say ~2 m
+    p = _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(depth_weight=1.0, depth_normal_weight=0.05))
+    gpu, stats = _run_loss(p, cam, F, A, depth, None)
+    assert stats["V_d"] == 0 and stats["V_dn"] == 0
+    assert np.count_nonzero(gpu) == 0
+    assert ref.resolve(F.astype(np.float64), A.astype(np.float64), rays, ref.Settings())[0].max() == 0.0
+
+
+def test_fixed_point_disparity_sums_fit_the_bound_the_range_sets():
+    """1 mm (the nearest valid depth) is a disparity of 1000 / m; at SSI_MEAN_SCALE over 24 Mpx the sum stays in
+    int64. The range check is what makes this bound hold for center depth too."""
+    from trainer.backend.render.geometry import SSI_MEAN_SCALE
+    assert 1000.0 * SSI_MEAN_SCALE * 24e6 < 2**63
+
+
+@pytest.mark.parametrize("term", ["depth", "normal", "dn"])
+@pytest.mark.parametrize("off_center", [False, True], ids=["centred", "off-centre"])
+def test_each_term_alone_matches_the_reference(term, off_center):
+    """T1 sums the three terms, so a 15% error in the smallest could hide under its tolerance: each term alone,
+    also with an off-centre principal point."""
+    rng = np.random.default_rng(11)
+    cam, rays, F, A, z, n = _synthetic_frame(rng, plane=False)
+    if off_center:
+        cam.proj_matrix[0, 2], cam.proj_matrix[1, 2] = 0.12, -0.08
+        rays = ref.rays_for(cam.proj_matrix.astype(np.float64), W, H)
+    depth, normal = _priors(rng, z, n)
+    weights = {"depth": (1.0, 0.0, 0.0), "normal": (0.0, 0.2, 0.0), "dn": (0.0, 0.0, 0.05)}[term]
+    cfg = GeometryConfig(depth_weight=weights[0], normal_weight=weights[1], depth_normal_weight=weights[2])
+    p = _pipeline(_device(GEOM_PRIORS=True), cfg)
+    gpu, _ = _run_loss(p, cam, F, A, depth if weights[0] else None, normal if weights[1] else None)
+    s = ref.Settings(w_d=weights[0], w_n=weights[1], w_dn=weights[2])
+    fd, sets = ref.fd_gradient(_reference_frame(rays, F, A, depth if weights[0] else None,
+                                                normal if weights[1] else None, None), s)
+    assert sets[term].sum() > 0 and np.abs(fd).max() > 0
+    assert _rel_err(gpu, fd) < 2e-3
+
+
+def test_cos_normal_error_is_never_negative():
+    """A decoded 8-bit normal is up to ~1% off unit length; 1 - dot(nh, g) then went below 0 when the render
+    matched the prior's direction. The prior is normalised before use."""
+    rng = np.random.default_rng(3)
+    cam, rays, F, A, z, n = _synthetic_frame(rng, plane=False)
+    _, normal = _priors(rng, z, n, pw=W, ph=H)
+    g = ref.normal_codes_to_n(normal)
+    raw = normal[..., :3].astype(np.float64) / 255.0 * 2.0 - 1.0
+    assert np.abs(np.linalg.norm(raw, axis=-1) - 1.0).max() > 2e-3            # the codes are off unit length
+    F = F.copy()
+    F[..., :3] = (A[..., None] * np.where(np.linalg.norm(g, axis=-1, keepdims=True) > 0, g, n)).astype(np.float32)
+    p = _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(normal_weight=1.0, normal_loss="cos"))
+    _, stats = _run_loss(p, cam, F, A, None, normal)
+    assert stats["V_n"] > 0
+    assert stats["loss_n"] >= -1e-4 and abs(stats["loss_n"]) / stats["V_n"] < 1e-4
+
+
+def test_geom_priors_define_zero_is_off():
+    """Slang reads GEOM_PRIORS="0" as off; the pipeline must too, or it binds geometry arguments the kernels lack."""
+    from trainer.backend.render.pipeline import TrainingPipeline
+    device = create_device(backend="vulkan", defines={"GEOM_PRIORS": "0"})
+    try:
+        p = TrainingPipeline(device, W, H, max_splats=16)
+        assert p.geom_priors is False and p.geometry_forward is None
+        p.set_gaussians(**_scene())
+        p.render(_camera(fov=60.0))
+        assert p.read_output_image()[..., 3].max() > 0.1
+    finally:
+        device.close()
+
+
+def test_stbn_config_is_refused_with_the_image_terms(monkeypatch):
+    """The aux seeds carry no STBN unbiasing scale, so a subsampled run would underweight them silently. The CLI
+    refuses it; the pipeline must too, for API callers. (The STBN table load is stubbed: the asset is not needed
+    to show the pipeline accepts the combination.)"""
+    from trainer.backend.render import pipeline as pipeline_module
+    from trainer.backend.render.stbn_mask import StbnMask
+    from trainer.config.config import StbnConfig
+    monkeypatch.setattr(pipeline_module.StbnMask, "for_config", classmethod(lambda cls, device, _c: StbnMask.disabled(device)))
+    _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(flatten_weight=1.0), stbn_config=StbnConfig(pixel_fraction=0.5))
+    with pytest.raises(RuntimeError, match="STBN"):
+        _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(depth_normal_weight=0.05),
+                  stbn_config=StbnConfig(pixel_fraction=0.5))
+
+
+def test_stbn_subsampled_step_is_refused_with_the_image_terms():
+    from trainer.config.config import StbnVariables
+    p = _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(depth_normal_weight=0.05))
+    p.set_primitive_from_numpy(**_scene())
+    p.targets.set_image(np.ones((H, W, 3), np.float32))
+    with pytest.raises(RuntimeError, match="STBN"):
+        p.forward_and_loss(_camera(fov=60.0), stbn=StbnVariables(slice_index=0, pixels_per_tile=16))
+
+
+def test_viewer_allocates_no_geometry_and_renders_the_same_colour():
+    """The viewer never reads the geometry composite: under GEOM_PRIORS it binds a one-element stub and the
+    forward skips the composite, and its colour is the plain viewer's, bit for bit."""
+    from trainer.backend.render.pipeline import TrainingPipeline
+    images = []
+    for on in (False, True):
+        p = TrainingPipeline(_device(GEOM_PRIORS=on), W, H, max_splats=16, viewer_only=True)
+        if on:
+            g = p.geometry_forward
+            assert g.geom_data.size == 16 and (g.aux_image.width, g.aux_image.height) == (1, 1)
+        p.set_gaussians(**_scene())
+        p.render(_camera(fov=60.0))
+        images.append(p.read_output_image().copy())
+    assert images[0][..., 3].max() > 0.1 and np.array_equal(images[0], images[1])
+
+
+def test_viewer_resize_releases_the_old_geometry_first(monkeypatch):
+    from trainer.backend.render import pipeline as pipeline_module
+    from trainer.backend.render.pipeline import TrainingPipeline
+    p = TrainingPipeline(_device(GEOM_PRIORS=True), W, H, max_splats=16, viewer_only=True)
+    seen = []
+    real = pipeline_module.GeometryForward
+
+    def spy(*args, **kwargs):
+        seen.append(p.geometry_forward)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(pipeline_module, "GeometryForward", spy)
+    p.resize(32)
+    assert seen == [None]
+
+
+def _resource_bytes(*owners) -> int:
+    import slangpy as spy
+    total = 0
+    for owner in owners:
+        for value in list(vars(owner).values()) + list(getattr(owner, "seeds", {}).values()):
+            if isinstance(value, (spy.Buffer, spy.Texture)):
+                total += value.memory_usage.device
+    return total
+
+
+def test_geometry_memory_is_reported_and_planned():
+    """GeometryForward and GeometryTerms sit outside pipeline.buffers: the run report and the VRAM plan must count
+    them (~385 MB at 4M splats / 1600x1200)."""
+    from trainer.backend.render.pipeline import estimate_pipeline_bytes
+    from trainer.frontend.evaluation.run_report import gpu_allocation
+    cfg = GeometryConfig(depth_weight=1.0, normal_weight=0.2, depth_normal_weight=0.05)
+    p = _pipeline(_device(GEOM_PRIORS=True), cfg)
+    geometry = _resource_bytes(p.geometry_forward, p.geometry)
+    assert geometry > 0
+    from trainer.backend.memory.budget import allocated_bytes
+    reported = gpu_allocation(p)["total_bytes"]
+    assert reported >= sum(allocated_bytes(p.buffers).values()) + geometry
+    shape = dict(max_splats=16, width=W, height=H, sh_degree=0)
+    planned = (estimate_pipeline_bytes(p.shared_data_module, geometry_config=cfg, **shape)
+               - estimate_pipeline_bytes(p.shared_data_module, **shape))
+    assert 0.8 * geometry <= planned <= 1.25 * geometry, (planned, geometry)
+
+
+def test_geometry_before_geom_from_composites_nothing():
+    """Before --geom-from the image terms are off: no feature pass, no composite, no loss passes; dL_dAux reads
+    zero for the backward, and the counters are not touched."""
+    cfg = GeometryConfig(depth_normal_weight=0.05)
+    p = _pipeline(_device(GEOM_PRIORS=True), cfg)
+    p.set_primitive_from_numpy(**_scene())
+    p.targets.set_image(np.ones((H, W, 3), np.float32))
+    sentinel = np.full((H, W, 4), 7.0, np.float32)
+    p.geometry_forward.aux_image.copy_from_numpy(sentinel)
+    p.geometry.dL_dAux.copy_from_numpy(sentinel)
+    p.geometry.stats.copy_from_numpy(np.full(2 * 17, 3, np.uint32)[:p.geometry.stats.size // 4])
+    before = p.geometry.stats.to_numpy().copy()
+    p.geometry.active = False
+    _forward(p, _camera(fov=60.0))
+    assert np.array_equal(p.geometry_forward.aux_image.to_numpy(), sentinel)       # nothing composited
+    assert np.count_nonzero(p.geometry.dL_dAux.to_numpy()) == 0                     # the backward reads zero
+    assert np.array_equal(p.geometry.stats.to_numpy(), before)
+    p.geometry.active = True
+    _forward(p, _camera(fov=60.0))
+    assert not np.array_equal(p.geometry_forward.aux_image.to_numpy(), sentinel)   # the control
+
+
+def test_zero_grad_clears_the_geometry_seeds():
+    p = _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(depth_normal_weight=0.05))
+    for b in p.geometry.seeds.values():
+        b.copy_from_numpy(np.full(2 * p.max_splats, 5, np.uint32))
+    p.optimizer.zero_grad()
+    p.runtime.wait_for_idle()
+    assert all(np.count_nonzero(v) == 0 for v in p.geometry.read_seeds().values())
+
+
+def test_skipped_depth_frame_logs_no_depth_loss():
+    """A frame whose scale-shift fit was skipped still counts its depth pixels; the log must say '-', not 0."""
+    w = h = 32
+    u, _ = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
+    D = 2.0 + u
+    depth = np.rint(1000.0 * (5.0 - 2.0 * u)).astype(np.uint16)      # inverted: the fit is skipped
+    A = np.full((h, w), 0.9, np.float32)
+    F = np.zeros((h, w, 4), np.float32)
+    F[..., 2] = -0.9
+    F[..., 3] = A * D
+    p = _pipeline(_device(GEOM_PRIORS=True), GeometryConfig(depth_weight=1.0, depth_space="ssi"), w=w, h=h)
+    _, stats = _run_loss(p, _camera(w, h, 60.0), F, A, depth, None)
+    assert stats["V_d"] > 0 and stats["depth_on"] == 0
+    assert "depth - (" in p.geometry.log_line(stats)

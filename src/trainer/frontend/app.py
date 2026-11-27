@@ -19,7 +19,7 @@ import slangpy as spy
 from trainer.backend.compute.device import dispatch_groups_x
 from trainer.backend.densify.removal import accumulate_removal_cost, prune_by_removal_cost
 from trainer.backend.densify.structure_tensor import StructureTensor
-from trainer.backend.memory.budget import GIB, allocated_bytes, available_bytes, fit_capacity
+from trainer.backend.memory.budget import GIB, available_bytes, fit_capacity
 from trainer.backend.memory.buffers import frame_tiles, max_sort_pairs_limit
 from trainer.backend.platform.dxgi import query_video_memory
 from trainer.backend.render.pipeline import (
@@ -100,7 +100,7 @@ def load_priors(args, scene):
                         native_sizes=[getattr(e, "native_size", None) for e in images],
                         depth_dir=depth_dir, normal_dir=normal_dir,
                         normal_encoding=getattr(args, "normal_encoding", "slam"),
-                        cache_views=2, decode_workers=2)
+                        cache_views=2, decode_workers=2, train_indices=list(scene.train_indices))
 
 
 def require_geometry(args, pipeline, priors) -> None:
@@ -229,12 +229,14 @@ class TrainingApplication:
             self.prepare_training_context()
             self._run_training_and_post()
         finally:
-            self._close_targets()
+            self._close_datasets()
 
-    def _close_targets(self) -> None:
-        """Stop the target decode pool and drop its views; reads afterwards raise. Idempotent."""
+    def _close_datasets(self) -> None:
+        """Stop the target and prior decode pools and drop their views; reads afterwards raise. Idempotent."""
         if getattr(self, "targets", None) is not None:
             self.targets.close()
+        if getattr(self, "priors", None) is not None:
+            self.priors.close()
 
 
     def _begin_repeat_run(self) -> None:
@@ -288,8 +290,8 @@ class TrainingApplication:
         try:
             return self._train_and_write_artifacts(hold_viewer)
         finally:
-            # Also when training raises or a capture ends it: release the decode pool and its views.
-            self._close_targets()
+            # Also when training raises or a capture ends it: release the decode pools and their views.
+            self._close_datasets()
 
     def _train_and_write_artifacts(self, hold_viewer: bool) -> str | None:
         # TRAINING LOOP IS HERE
@@ -340,8 +342,8 @@ class TrainingApplication:
                 self._training_runtime.profiler.close()
             self._training_runtime.artifacts.close_all()
 
-        # Every target read is done; release the views before the CLI waits on the window.
-        self._close_targets()
+        # Every target and prior read is done; release the views before the CLI waits on the window.
+        self._close_datasets()
         if hold_viewer:
             stats = viewer.state.snapshot().stats
             viewer.state.training_completed(ResultInfo(
@@ -358,7 +360,7 @@ class TrainingApplication:
         pipeline = self._pipeline
         peak_pairs, overflows = (
             int(v) for v in pipeline.buffers.sort.stats.to_numpy().view(np.uint32))
-        owned = sum(allocated_bytes(pipeline.buffers).values())
+        owned = sum(pipeline.allocated_bytes().values())
         summary = {"max_splats": pipeline.max_splats,
                    "max_sort_pairs": pipeline.max_sort_pairs,
                    "peak_sort_pairs": peak_pairs, "sort_overflows": overflows,
@@ -480,10 +482,14 @@ class TrainingApplication:
             len(scene.train_indices) * scene.width * scene.height
             * (4 + (8 if structure else 0)))
 
+        from trainer.config.resolve import geometry_config
+        geometry = geometry_config(args)
+
         def cost(capacity: int) -> int:
             shape = {"max_splats": capacity, "width": scene.width,
                      "height": scene.height, "sh_degree": args.sh_degree}
-            total = estimate_pipeline_bytes(module, structure_aware=structure, max_sort_pairs=args.max_sort_pairs, **shape)
+            total = estimate_pipeline_bytes(module, structure_aware=structure, max_sort_pairs=args.max_sort_pairs,
+                                            geometry_config=geometry, **shape)
             if not args.no_viewer:
                 total += estimate_pipeline_bytes(module, viewer_only=True, **shape)
             return total + target_bytes
@@ -1082,11 +1088,23 @@ class TrainingLoop:
         self.runtime.pipeline.targets.select(self.target_textures[context.camera_index])
         geometry = getattr(self.runtime.pipeline, "geometry", None)
         if geometry is not None:
-            # The same window as --target-prefetch, driven by the same sampler peek.
+            step = context.step_number
+            active = step >= self.geom_from
             if getattr(self, "priors", None) is not None:
-                self.priors.prefetch([context.camera_index, *self.sampler.peek(self.args.target_prefetch)])
-                geometry.select(*self.priors.entry(context.camera_index))
-            geometry.active = context.step_number >= self.geom_from
+                # The same window as --target-prefetch, driven by the same sampler peek, but only over steps that
+                # read priors: from --geom-from on, and never past the last step.
+                ahead = self.args.target_prefetch
+                if getattr(self.args, "iters", 0):
+                    ahead = max(0, min(ahead, self.args.iters - step))
+                draws = self.sampler.peek(ahead)
+                window = [camera for k, camera in enumerate(draws, start=1) if step + k >= self.geom_from]
+                if active:
+                    window.insert(0, context.camera_index)
+                if window:
+                    self.priors.prefetch(window)
+                if active:
+                    geometry.select(*self.priors.entry(context.camera_index))
+            geometry.active = active
 
         if context.step_number == 1:
             print(f"[determinism] iter 1 cam_idx={context.camera_index} (should match across same-seed runs)")
@@ -1158,18 +1176,23 @@ class TrainingLoop:
         if mip_due:
             pipeline.mip_filter.compute()
 
+    def _log_geometry(self, context: IterationContext) -> None:
+        """The geometry terms' log line on log steps. Before --geom-from nothing ran, so the GPU is not waited on."""
+        geometry = getattr(self.runtime.pipeline, "geometry", None)
+        if not (context.events.log and geometry is not None and geometry.image_terms and geometry.active):
+            return
+        pipeline = self.runtime.pipeline
+        pipeline.runtime.wait_for_idle()
+        with pipeline.gpu_lock:
+            line = geometry.log_line(geometry.read_stats())
+        print(f"iter {context.step_number}: {line}", flush=True)
+        self.runtime.artifacts.log_txt.write(f"iter {context.step_number}: {line}\n")
+
     def _produce_observations(self, context: IterationContext) -> bool:
         self.runtime.viewer.checkpoint()
         self.runtime.reporter.report_throughput(context)
 
-        geometry = getattr(self.runtime.pipeline, "geometry", None)
-        if context.events.log and geometry is not None and geometry.image_terms:
-            pipeline = self.runtime.pipeline
-            pipeline.runtime.wait_for_idle()
-            with pipeline.gpu_lock:
-                line = geometry.log_line(geometry.read_stats())
-            print(f"iter {context.step_number}: {line}", flush=True)
-            self.runtime.artifacts.log_txt.write(f"iter {context.step_number}: {line}\n")
+        self._log_geometry(context)
 
         if context.step_number > 1 and (context.events.log or context.events.preview):
             ok, self.gaussian_count = self.runtime.reporter.report_iteration(

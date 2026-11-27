@@ -13,6 +13,7 @@ from __future__ import annotations
 import numpy as np
 import slangpy as spy
 
+from trainer.backend.compute.device import define_enabled
 from trainer.backend.compute.gpu import CommandRecorder
 from trainer.backend.compute.kernels import KernelLibrary
 from trainer.config.config import GeometryConfig
@@ -21,10 +22,11 @@ _TEX_USAGE = spy.TextureUsage.shader_resource | spy.TextureUsage.unordered_acces
 _BUF_USAGE = spy.BufferUsage.shader_resource | spy.BufferUsage.unordered_access
 _BUF_COPY = _BUF_USAGE | spy.BufferUsage.copy_source | spy.BufferUsage.copy_destination
 
-GEOM_STATS_SLOTS = 16
+GEOM_STATS_SLOTS = 17
 SLOT = {"V_d": 0, "V_n": 1, "V_dn": 2, "sum_x": 3, "sum_y": 4, "sum_rx": 5, "sum_ry": 6, "sum_rxx": 7,
-        "sum_rxy": 8, "loss_d": 9, "loss_n": 10, "loss_dn": 11, "skipped_frames": 14, "depth_frames": 15}
-_COUNT_SLOTS = {"V_d", "V_n", "V_dn", "skipped_frames", "depth_frames"}
+        "sum_rxy": 8, "loss_d": 9, "loss_n": 10, "loss_dn": 11, "depth_on": 14, "skipped_frames": 15,
+        "depth_frames": 16}
+_COUNT_SLOTS = {"V_d", "V_n", "V_dn", "depth_on", "skipped_frames", "depth_frames"}
 _MEAN_SLOTS = {"sum_x", "sum_y"}          # summed at SSI_MEAN_SCALE (geom_loss.slang)
 SSI_MEAN_SCALE = 16777216.0
 SLOT_SSI_A, SLOT_SSI_B = 12, 13
@@ -38,8 +40,30 @@ FLATTEN_FLOOR_M = 1e-5
 
 
 def compiled_with_geometry(session: spy.SlangSession) -> bool:
-    defines = session.desc.compiler_options.defines or {}
-    return bool(defines.get("GEOM_PRIORS"))
+    return define_enabled(session.desc.compiler_options.defines, "GEOM_PRIORS")
+
+
+def geometry_estimate_bytes(config: GeometryConfig | None, *, capacity: int, width: int, height: int) -> int:
+    """Device bytes GeometryForward + GeometryTerms allocate for a training pipeline (no GPU work), the prior
+    textures at their largest (the training size). 0 without the image terms."""
+    if config is None or not config.image_terms:
+        return 0
+    cap, pixels = max(1, int(capacity)), int(width) * int(height)
+    forward = 16 * cap + 16 * pixels                        # geom_data, aux_image
+    terms = 2 * 16 * pixels + len(SEED_NAMES) * 8 * cap + 8 * GEOM_STATS_SLOTS   # resolved, dL_dAux, seeds, stats
+    priors = 2 * pixels + 4 * pixels                        # r16_uint depth, rgba8_uint normal
+    return forward + terms + priors
+
+
+def resource_bytes(owner) -> dict[str, int]:
+    """Device bytes of every buffer and texture attribute of ``owner`` (a dict attribute is summed)."""
+    out = {}
+    for name, value in vars(owner).items():
+        values = list(value.values()) if isinstance(value, dict) else [value]
+        size = sum(v.memory_usage.device for v in values if isinstance(v, (spy.Buffer, spy.Texture)))
+        if size:
+            out[name] = size
+    return out
 
 
 def _texture(device: spy.Device, fmt: spy.Format, width: int, height: int, label: str) -> spy.Texture:
@@ -57,18 +81,24 @@ class GeometryForward:
     KERNELS = {"geom_features": ("rasterize/tile_binned/geom_features.slang", "geomFeatures")}
 
     def __init__(self, device: spy.Device, kernels: KernelLibrary, *, width: int, height: int,
-                 capacity: int, plane_depth: bool = False) -> None:
+                 capacity: int, plane_depth: bool = False, stub: bool = False) -> None:
+        """``stub``: the forward kernel's arguments only, one element each, never composited (the viewer: it
+        never reads the composite, so it must not pay 16 B per splat and per pixel for it)."""
         self._k = kernels.load(self.KERNELS)
-        self.capacity = capacity
+        self.capacity = 1 if stub else capacity
         self.plane_depth = bool(plane_depth)
+        self.stub = bool(stub)
+        # Whether the forward composites (N, S): off for a stub and before --geom-from (GeometryTerms.active).
+        self.composite = not stub
         # Tests write geom_data themselves and skip the feature kernel.
         self.skip_features = False
-        self.geom_data = _buffer(device, 16 * max(1, capacity), "geom_data")
-        self.aux_image = _texture(device, spy.Format.rgba32_float, width, height, "geom_aux_image")
+        self.geom_data = _buffer(device, 16 * max(1, self.capacity), "geom_data")
+        self.aux_image = _texture(device, spy.Format.rgba32_float, 1 if stub else width, 1 if stub else height,
+                                  "geom_aux_image")
 
     def record(self, commands: CommandRecorder, *, gaussians, active_count, camera,
                cluster_visible) -> None:
-        if self.skip_features:
+        if self.skip_features or not self.composite:
             return
         commands.dispatch(self._k.geom_features, "geom_features",
             thread_count=[self.capacity, 1, 1],
@@ -77,7 +107,10 @@ class GeometryForward:
             plane_depth=int(self.plane_depth), max_splats=self.capacity)
 
     def forward_kwargs(self) -> dict:
-        return {"geom_data": self.geom_data, "aux_image": self.aux_image}
+        return {"geom_data": self.geom_data, "aux_image": self.aux_image, "aux_on": int(self.composite)}
+
+    def resource_bytes(self) -> dict[str, int]:
+        return resource_bytes(self)
 
 
 class GeometryTerms:
@@ -110,7 +143,8 @@ class GeometryTerms:
         self.loss_mask = loss_mask
         self.image_terms = forward is not None
         self._k = kernels.load({**(self.LOSS_KERNELS if self.image_terms else {}), **self.BACKWARD_KERNELS})
-        self.active = True               # the three image terms (--geom-from gates them)
+        self._active = True              # the three image terms (--geom-from gates them)
+        self._grad_zeroed = False        # dL_dAux holds zeros since the terms went inactive
         self._has_depth = self._has_normal = False
         self._pending_depth = self._pending_normal = None
         if self.image_terms:
@@ -124,6 +158,20 @@ class GeometryTerms:
             self.stats = _buffer(device, 8 * GEOM_STATS_SLOTS, "geom_stats")
             self.stats.copy_from_numpy(np.zeros(2 * GEOM_STATS_SLOTS, dtype=np.uint32))
             self.set_prior_grids((1, 1), (1, 1))
+
+    @property
+    def active(self) -> bool:
+        """Whether the image terms run this step. Off (before --geom-from) the forward composites nothing and the
+        loss passes do not run; dL_dAux reads zero for the backward."""
+        return self._active
+
+    @active.setter
+    def active(self, on: bool) -> None:
+        self._active = bool(on)
+        if self.forward is not None:
+            self.forward.composite = self._active
+        if self._active:
+            self._grad_zeroed = False
 
     # ------------------------------------------------------------------ priors
 
@@ -178,9 +226,19 @@ class GeometryTerms:
         """Pass R then pass G: writes dL_dAux. ``loss_mask`` is ``{"loss_mask": target}``."""
         if not self.image_terms:
             return
-        self._flush()
         commands = self._commands
         threads = [self.width, self.height, 1]
+        if not self.active:
+            # The blend backward still reads dL_dAux: zero it once (a weightless grad pass writes zeros and touches
+            # no counter), then nothing until the terms switch on. The priors are not uploaded either.
+            if not self._grad_zeroed:
+                frame = self._frame_kwargs(output_image, camera, loss_mask)
+                frame.update(has_depth=0, has_normal=0)
+                commands.dispatch(self._k.grad, "geom_grad_zero", thread_count=threads, dL_dAux=self.dL_dAux,
+                                  depth_space=0, normal_cos=0, w_depth=0.0, w_normal=0.0, w_dn=0.0, **frame)
+                self._grad_zeroed = True
+            return
+        self._flush()
         w_d, w_n, w_dn = self.weights()
         frame = self._frame_kwargs(output_image, camera, loss_mask)
         with commands.marker_group("geom_loss"):
@@ -257,11 +315,19 @@ class GeometryTerms:
         return {n: np.frombuffer(b.to_numpy().tobytes(), dtype=np.int64) / FIXED_SCALE
                 for n, b in self.seeds.items()}
 
+    def resource_bytes(self) -> dict[str, int]:
+        return resource_bytes(self)
+
     def log_line(self, stats: dict, skipped_frames_total: int | None = None) -> str:
-        def mean(key, count):
+        """The step's mean of each term as the loss optimizes it, or '-' for a term that did not run (weight 0,
+        a skipped scale-shift fit, no supervised pixel). The l1 normal error is a per-component mean."""
+        c = self.config
+        def mean(key, count, weight, ran=True, per=1.0):
             n = stats.get(count, 0)
-            return f"{stats.get(key, 0.0) / n:.5f}" if n else "-"
+            return f"{stats.get(key, 0.0) / (per * n):.5f}" if (n and weight > 0.0 and ran) else "-"
         skipped = stats.get("skipped_frames", 0) if skipped_frames_total is None else skipped_frames_total
-        return (f"[geom] depth {mean('loss_d', 'V_d')} ({stats.get('V_d', 0)}) | normal "
-                f"{mean('loss_n', 'V_n')} ({stats.get('V_n', 0)}) | dn {mean('loss_dn', 'V_dn')} "
-                f"({stats.get('V_dn', 0)}) | skipped frames {skipped}")
+        depth = mean("loss_d", "V_d", c.depth_weight, ran=bool(stats.get("depth_on", 1)))
+        normal = mean("loss_n", "V_n", c.normal_weight, per=3.0 if c.normal_loss == "l1" else 1.0)
+        dn = mean("loss_dn", "V_dn", c.depth_normal_weight)
+        return (f"[geom] depth {depth} ({stats.get('V_d', 0)}) | normal {normal} ({stats.get('V_n', 0)}) | "
+                f"dn {dn} ({stats.get('V_dn', 0)}) | skipped frames {skipped}")

@@ -417,8 +417,7 @@ def test_memory_report_decodes_no_image(tmp_path, monkeypatch):
     views = CompressedTargetViews(targets, _pack())
     stats = SimpleNamespace(to_numpy=lambda: np.zeros(2, np.uint32))
     pipeline = SimpleNamespace(buffers=SimpleNamespace(sort=SimpleNamespace(stats=stats)), max_splats=1,
-                               max_sort_pairs=1)
-    monkeypatch.setattr(app_module, "allocated_bytes", lambda _buffers: {"x": 0})
+                               max_sort_pairs=1, allocated_bytes=lambda: {"x": 0})
     monkeypatch.setattr(app_module, "query_video_memory", lambda _name: None)
     app = SimpleNamespace(_pipeline=pipeline, _stream_targets=False, _targets=targets, target_textures=views,
                           structure_textures={}, args=SimpleNamespace(run_report=True),
@@ -594,7 +593,7 @@ def test_cli_run_closes_its_targets(path):
         raise RuntimeError("boom")
     app = SimpleNamespace(targets=targets, build_training_loop=build,
                           _training_runtime=SimpleNamespace(artifacts=SimpleNamespace(close_all=lambda: None)))
-    app._close_targets = lambda: TrainingApplication._close_targets(app)
+    app._close_datasets = lambda: TrainingApplication._close_datasets(app)
     app._train_and_write_artifacts = lambda hold: TrainingApplication._train_and_write_artifacts(app, hold)
     if path == "start-training":
         def prepare():
@@ -625,7 +624,7 @@ def test_hub_run_that_fails_to_build_closes_its_targets():
         raise RuntimeError("setup failed")
     hub = TrainingHub.__new__(TrainingHub)
     hub.app = SimpleNamespace(_viewer=viewer, viewer=viewer, _begin_repeat_run=begin,
-                              _close_targets=lambda: closed.append(1))
+                              _close_datasets=lambda: closed.append(1))
     hub._hub_ensure_stbn = lambda _setup: True
     real = hub_module.report_exception
     hub_module.report_exception = noop

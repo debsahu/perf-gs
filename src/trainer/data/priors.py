@@ -69,7 +69,8 @@ def find_prior_path(prior_dir: Path, image_name: str) -> Path | None:
     return found[0] if found else None
 
 
-def match_priors(prior_dir: str | Path, image_names: Sequence[str], kind: str) -> list[Path | None]:
+def match_priors(prior_dir: str | Path, image_names: Sequence[str], kind: str,
+                 what: str = "images") -> list[Path | None]:
     """The prior file of each image (None when it has none). Zero matches is an error."""
     prior_dir = Path(prior_dir)
     if not prior_dir.is_dir():
@@ -77,13 +78,20 @@ def match_priors(prior_dir: str | Path, image_names: Sequence[str], kind: str) -
     paths = [find_prior_path(prior_dir, n) for n in image_names]
     matched = sum(p is not None for p in paths)
     if matched == 0:
-        raise PriorError(f"no {kind} prior in {prior_dir} matches any of the {len(image_names)} images")
+        raise PriorError(f"no {kind} prior in {prior_dir} matches any of the {len(image_names)} {what}")
     if matched < len(image_names):
-        print(f"[priors] {kind}: {matched} of {len(image_names)} images have a prior; "
+        print(f"[priors] {kind}: {matched} of {len(image_names)} {what} have a prior; "
               f"the other {len(image_names) - matched} train without the {kind} term")
     else:
-        print(f"[priors] {kind}: {matched} of {len(image_names)} images matched")
+        print(f"[priors] {kind}: {matched} of {len(image_names)} {what} matched")
     return paths
+
+
+def _png_shape(data: bytes) -> tuple[int, int] | None:
+    """(height, width) from a PNG's IHDR, without decoding; None for anything else."""
+    if data[:8] != _PNG or data[12:16] != b"IHDR" or len(data) < 24:
+        return None
+    return int.from_bytes(data[20:24], "big"), int.from_bytes(data[16:20], "big")
 
 
 # ---------------------------------------------------------------------------- decoding
@@ -96,8 +104,41 @@ def _sniff(data: bytes) -> str:
     raise PriorError("not a PNG or TIFF file")
 
 
+def tiff_orientation(data: bytes) -> int:
+    """TIFF tag 274 (Orientation) of the first image, 1 when absent. Classic and BigTIFF."""
+    import struct
+    order = "<" if data[:2] == b"II" else ">"
+    try:
+        magic = struct.unpack_from(order + "H", data, 2)[0]
+        if magic == 42:
+            offset = struct.unpack_from(order + "I", data, 4)[0]
+            count = struct.unpack_from(order + "H", data, offset)[0]
+            entries, size, value_at = offset + 2, 12, 8
+        elif magic == 43:
+            offset = struct.unpack_from(order + "Q", data, 8)[0]
+            count = struct.unpack_from(order + "Q", data, offset)[0]
+            entries, size, value_at = offset + 8, 20, 12
+        else:
+            return 1
+        for k in range(count):
+            at = entries + k * size
+            tag, kind = struct.unpack_from(order + "HH", data, at)
+            if tag == 274:
+                return struct.unpack_from(order + ("H" if kind == 3 else "I"), data, at + value_at)[0]
+    except struct.error as error:
+        raise PriorError(f"malformed TIFF header: {error}") from error
+    return 1
+
+
 def _imdecode(data: bytes, what: str) -> np.ndarray:
     import cv2
+    if data[:4] in _TIFF:
+        # OpenCV applies the orientation tag even with IMREAD_IGNORE_ORIENTATION: it would turn or transpose the
+        # pixels (a 180-degree turn keeps the shape, so the aspect check passes) and never the normal vectors.
+        orientation = tiff_orientation(data)
+        if orientation != 1:
+            raise PriorError(f"{what}: TIFF orientation tag is {orientation}; write the prior without it "
+                             "(or with orientation 1), in the image's own pixel layout")
     image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise PriorError(f"failed to decode {what}")
@@ -113,11 +154,13 @@ def quantize_depth_m(depth_m: np.ndarray) -> np.ndarray:
 
 
 def encode_normal_codes(normal: np.ndarray) -> np.ndarray:
-    """Unit normals ((0,0,0) invalid) to slam uint8 codes: rint((n + 1) / 2 * 255), half to even."""
+    """Unit normals ((0,0,0) invalid) to slam uint8 codes: rint((n + 1) / 2 * 255), half to even. A pixel with a
+    non-finite component is invalid (the sentinel 128), as a non-finite depth is."""
     n = np.asarray(normal, dtype=np.float32)
-    if not np.all(np.isfinite(n)):
-        raise PriorError("normal prior has non-finite values")
-    return np.rint((np.clip(n, -1.0, 1.0) + 1.0) / 2.0 * 255.0).astype(np.uint8)
+    bad = ~np.isfinite(n).all(axis=-1)
+    codes = np.rint((np.clip(np.where(bad[..., None], 0.0, n), -1.0, 1.0) + 1.0) / 2.0 * 255.0).astype(np.uint8)
+    codes[bad] = 128
+    return codes
 
 
 def decode_normal_codes(codes: np.ndarray) -> np.ndarray:
@@ -179,10 +222,17 @@ def common_grid(shapes: Iterable[tuple[int, int]], image_wh: tuple[int, int]) ->
     """(height, width) of one kind's GPU texture: the training image's grid at the density of the
     densest prior (s = max sqrt(prior pixels / training pixels)), capped at the training size."""
     w, h = image_wh
-    s = max(np.sqrt(ph * pw / (w * h)) for ph, pw in shapes)
+    shapes = list(shapes)
+    densest = max(shapes, key=lambda hw: hw[0] * hw[1])
+    s = np.sqrt(densest[0] * densest[1] / (w * h))
     if s >= 1.0:
         return h, w
-    return max(1, int(round(h * s))), max(1, int(round(w * s)))
+    grid = max(1, int(round(h * s))), max(1, int(round(w * s)))
+    # The densest prior passed the aspect check against its image; keep its own grid when rounding lands a pixel
+    # off it, so its file bytes pass through instead of being resized and re-encoded.
+    if abs(grid[0] - densest[0]) <= 1 and abs(grid[1] - densest[1]) <= 1:
+        return tuple(densest)
+    return grid
 
 
 def nearest_resize(image: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
@@ -261,9 +311,9 @@ def check_normal_priors(views: Sequence[tuple[str, np.ndarray, tuple[float, floa
             if c.valid == 0.0:
                 hint = " The map has no valid pixel. Check --normal-encoding (slam: 128 = invalid; spirula: black)."
             elif c.facing < 0.5:
-                hint = (" The map points AWAY from the camera; negate it first "
-                        "(ingest/splatcam/convert_priors.py --negate-normals).")
-            elif c.length_max > CHECK_MAX_LENGTH or abs(c.length_p01 - 1.0) > CHECK_LENGTH_TOL:
+                hint = " The map points AWAY from the camera; negate every normal (n -> -n) and write it again."
+            elif (c.length_max > CHECK_MAX_LENGTH or abs(c.length_p01 - 1.0) > CHECK_LENGTH_TOL
+                  or abs(c.length_p99 - 1.0) > CHECK_LENGTH_TOL):
                 hint = (" Some decoded normals are not unit length. Check --normal-encoding: a spirula map read as "
                         "slam decodes black (invalid) pixels to (-1, -1, -1).")
             raise PriorError(
@@ -275,6 +325,8 @@ def check_normal_priors(views: Sequence[tuple[str, np.ndarray, tuple[float, floa
 def check_indices(count: int, views: int = CHECK_VIEWS) -> list[int]:
     if count <= views:
         return list(range(count))
+    if views <= 1:
+        return [0] if views == 1 else []
     return sorted({round(i * (count - 1) / (views - 1)) for i in range(views)})
 
 
@@ -301,23 +353,34 @@ class PriorDataset:
                  native_sizes: Sequence[tuple[int, int] | None] | None = None,
                  depth_dir: str | Path | None = None, normal_dir: str | Path | None = None,
                  normal_encoding: str = "slam", cache_views: int = 2, decode_workers: int = 2,
-                 check_normals: bool = True) -> None:
+                 check_normals: bool = True, train_indices: Sequence[int] | None = None) -> None:
+        """Indexed like ``image_names``. With ``train_indices`` only those views' priors are matched, loaded and
+        checked: a held-out view is never trained on, so its prior is never read."""
         self.image_wh = tuple(image_wh)
         n = len(image_names)
+        train = list(range(n)) if train_indices is None else sorted(set(int(i) for i in train_indices))
+        what = "images" if train_indices is None else "training images"
         self._native = [tuple(s) if s is not None else self.image_wh
                         for s in (native_sizes or [None] * n)]
         self._depth: list[bytes | None] = [None] * n
         self._normal: list[bytes | None] = [None] * n
         self.depth_hw = self.normal_hw = (1, 1)
         self.counts = {"depth": 0, "normal": 0, "images": n}
+        def matched(prior_dir, kind) -> list[Path | None]:
+            found = match_priors(prior_dir, [image_names[i] for i in train], kind, what)
+            paths: list[Path | None] = [None] * n
+            for i, path in zip(train, found):
+                paths[i] = path
+            return paths
+
         if depth_dir is not None:
-            self._depth, self.depth_hw = self._load(match_priors(depth_dir, image_names, "depth"),
+            self._depth, self.depth_hw = self._load(matched(depth_dir, "depth"),
                                                     lambda b, p: decode_depth(b, str(p)),
                                                     lambda b: _sniff(b) == "png")
             self.counts["depth"] = sum(b is not None for b in self._depth)
         if normal_dir is not None:
             self._normal, self.normal_hw = self._load(
-                match_priors(normal_dir, image_names, "normal"),
+                matched(normal_dir, "normal"),
                 lambda b, p: decode_normal(b, normal_encoding, str(p)),
                 lambda b: _sniff(b) == "png" and normal_encoding == "slam")
             self.counts["normal"] = sum(b is not None for b in self._normal)
@@ -335,7 +398,9 @@ class PriorDataset:
         for i, p in enumerate(paths):
             if p is None:
                 continue
-            shape = decode(p.read_bytes(), p).shape[:2]
+            data = p.read_bytes()
+            # A PNG's grid is in its header; only a TIFF is decoded to learn it (pass 2 decodes every file).
+            shape = _png_shape(data) or decode(data, p).shape[:2]
             check_aspect(shape, self._native[i], str(p))
             shapes.append(shape)
         hw = common_grid(shapes, self.image_wh)

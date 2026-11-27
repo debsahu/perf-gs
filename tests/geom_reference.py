@@ -9,7 +9,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-PLANE_MIN_DOT, PLANE_MIN_DEPTH, PLANE_MAX_DEPTH = 0.05, 1e-3, 1e4
+PLANE_MIN_DOT = 0.05
+DEPTH_MIN_M, DEPTH_MAX_M = 1e-3, 1e4          # the valid rendered-depth range, in metres (depth / U)
 SATURATED = 65535
 
 
@@ -63,7 +64,8 @@ def normal_codes_to_n(codes: np.ndarray) -> np.ndarray:
     n[codes[..., :3] == 128] = 0.0
     l2 = np.sum(n * n, -1)
     n[(l2 < 0.49) | (l2 > 1.69)] = 0.0
-    return n
+    length = np.linalg.norm(n, axis=-1, keepdims=True)
+    return np.where(length > 0, n / np.maximum(length, 1e-300), 0.0)
 
 
 def resolve(F, A, rays, s: Settings):
@@ -76,10 +78,11 @@ def resolve(F, A, rays, s: Settings):
         if s.plane:
             den = np.sum(N * rays, -1)
             D = S / den
-            ok = cover & (np.abs(den) >= PLANE_MIN_DOT) & (D >= PLANE_MIN_DEPTH) & (D <= PLANE_MAX_DEPTH)
+            ok = cover & (np.abs(den) >= PLANE_MIN_DOT)
         else:
             D = S / A
-            ok = cover & np.isfinite(D) & (D > 0)
+            ok = cover
+        ok &= np.isfinite(D) & (D / s.U >= DEPTH_MIN_M) & ((D / s.U <= DEPTH_MAX_M) | (not s.plane))
     return np.where(ok, D, 0.0), nh
 
 
@@ -105,8 +108,9 @@ def supervision(f: Frame, s: Settings):
         x = 1.0 / f.Dg[depth]
         y = s.U / D[depth]
         vxx = np.mean(x * x) - np.mean(x) ** 2
-        if depth.sum() >= 16 and vxx / np.mean(x) ** 2 > 1e-3:      # relative variance gate
-            a = (np.mean(x * y) - np.mean(x) * np.mean(y)) / vxx
+        a = (np.mean(x * y) - np.mean(x) * np.mean(y)) / vxx if vxx > 0 else 0.0
+        # relative variance gate, and a <= 0 (prior and render ordered oppositely) is not a fit
+        if depth.sum() >= 16 and vxx / np.mean(x) ** 2 > 1e-3 and a > 0:
             ab = (a, np.mean(y) - a * np.mean(x))
         else:
             depth = np.zeros_like(depth)
@@ -149,7 +153,9 @@ def loss(F: np.ndarray, f: Frame, s: Settings, sets: dict) -> float:
 
 
 def fd_gradient(f: Frame, s: Settings, eps: float = 1e-6) -> tuple[np.ndarray, dict]:
-    """Central finite differences of the loss with respect to every component of F."""
+    """Central finite differences of the loss with respect to every component of F. The step is relative to the
+    component (``eps * |F|``, at least ``eps * 1e-3``): at a small depth scale an absolute step moves a residual by
+    enough to straddle the kink of |r| and averages its two slopes."""
     sets = supervision(f, s)
     F = f.F.astype(np.float64)
     grad = np.zeros_like(F)
@@ -158,12 +164,13 @@ def fd_gradient(f: Frame, s: Settings, eps: float = 1e-6) -> tuple[np.ndarray, d
         for x in range(W):
             for k in range(4):
                 old = F[y, x, k]
-                F[y, x, k] = old + eps
+                step = eps * max(abs(old), 1e-3)
+                F[y, x, k] = old + step
                 lp = loss(F, f, s, sets)
-                F[y, x, k] = old - eps
+                F[y, x, k] = old - step
                 lm = loss(F, f, s, sets)
                 F[y, x, k] = old
-                grad[y, x, k] = (lp - lm) / (2 * eps)
+                grad[y, x, k] = (lp - lm) / (2 * step)
     return grad, sets
 
 

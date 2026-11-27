@@ -11,9 +11,9 @@
 
 #include "common/execution.slang"
 
-// No flatten gradient once the smallest axis is below this many scene units per metre: the Mip
-// compensation sqrt(prod s^2 / prod(s^2 + f^2)) underflows in float32 as one axis goes to zero.
-static const float FLATTEN_FLOOR_M = 1e-5;
+// No flatten gradient once the smallest axis is below flatten_floor_units (FLATTEN_FLOOR_M = 1e-5 m times the scene
+// units per metre, backend/render/geometry.py): the Mip compensation sqrt(prod s^2 / prod(s^2 + f^2)) underflows
+// in float32 as one axis goes to zero.
 
 [shader("compute")]
 [numthreads(256, 1, 1)]

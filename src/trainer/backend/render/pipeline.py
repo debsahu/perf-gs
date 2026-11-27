@@ -12,7 +12,7 @@ import slangpy as spy
 
 from trainer.backend.compute.algorithms import PrefixScan, RadixSort
 from trainer.backend.compute.device import SHADERS_DIR, define_enabled
-from trainer.backend.compute.execution import TILE_HEIGHT, TILE_WIDTH
+from trainer.backend.compute.execution import TILE_AREA, TILE_HEIGHT, TILE_WIDTH
 from trainer.backend.compute.gpu import CommandRecorder, GpuRuntime
 from trainer.backend.compute.kernels import KernelLibrary
 from trainer.backend.densify.morton import MortonReorder
@@ -21,12 +21,18 @@ from trainer.backend.densify.simple_densifier import SimpleDensifier
 from trainer.backend.densify.statistics import DensifyStatistics
 from trainer.backend.densify.structure_densifier import StructureDensifier
 from trainer.backend.memory import buffers
+from trainer.backend.memory.budget import allocated_bytes
 from trainer.backend.memory.arena import ArenaCommitter
 from trainer.backend.memory.primitive_io import PrimitiveIO, gaussian_records
 from trainer.backend.optimize.adam import AdamOptimizer
 from trainer.backend.optimize.regularization import Regularizer
 from trainer.backend.render.backward import RasterBackward
-from trainer.backend.render.geometry import GeometryForward, GeometryTerms, compiled_with_geometry
+from trainer.backend.render.geometry import (
+    GeometryForward,
+    GeometryTerms,
+    compiled_with_geometry,
+    geometry_estimate_bytes,
+)
 from trainer.backend.render.losses import ImageLoss
 from trainer.backend.render.mip_filter import MipFilter
 from trainer.backend.render.rasterizer import Rasterizer
@@ -71,15 +77,19 @@ def _num_tiles(width: int, height: int) -> int:
 
 def estimate_pipeline_bytes(module: spy.Module, *, max_splats: int, width: int,
                             height: int, sh_degree: int, structure_aware: bool = False,
-                            viewer_only: bool = False, max_sort_pairs: int | None = None) -> int:
-    """Base GPU bytes a pipeline of this shape allocates (no GPU work)."""
+                            viewer_only: bool = False, max_sort_pairs: int | None = None,
+                            geometry_config: GeometryConfig | None = None) -> int:
+    """Base GPU bytes a pipeline of this shape allocates (no GPU work). ``geometry_config`` adds the depth/normal
+    terms' own buffers, which live outside GaussianBuffers (a viewer binds a one-element stub: nothing)."""
     sizes = {"max_splats": max_splats, "width": width, "height": height,
              "max_sort_pairs": max_sort_pairs or default_sort_pairs(max_splats, viewer_only,
                                                                     _num_tiles(width, height)),
              "sh_rest_floats": sh_rest_coeffs(sh_degree) * 3}
     if not viewer_only:
         sizes["structure_aware"] = structure_aware
-    return buffers.estimate_allocation_bytes(module, viewer_only=viewer_only, **sizes)
+    geometry = 0 if viewer_only else geometry_estimate_bytes(geometry_config, capacity=max_splats,
+                                                              width=width, height=height)
+    return buffers.estimate_allocation_bytes(module, viewer_only=viewer_only, **sizes) + geometry
 
 
 class TrainingPipeline:
@@ -126,6 +136,10 @@ class TrainingPipeline:
         if self.geometry_config.image_terms and not self.geom_priors and not viewer_only:
             raise RuntimeError("depth/normal/depth-normal weights are set but the pipeline was compiled "
                                "without GEOM_PRIORS, so they would be ignored")
+        if (self.geometry_config.image_terms and not viewer_only and stbn_config is not None
+                and stbn_config.pixel_fraction < 1.0):
+            raise RuntimeError("depth/normal losses are not supported with STBN (pixel fraction < 1): their seeds "
+                               "carry no STBN unbiasing scale, and their gradient needs every pixel's neighbours")
         self.width = width
         self.height = height
         self.max_splats = max_splats
@@ -191,9 +205,11 @@ class TrainingPipeline:
         self.scan = PrefixScan(commands, kernels, b.scan)
         self.sort = RadixSort(commands, kernels, b.sort)
         self.primitives = PrimitiveIO(commands, kernels, b.primitive, capacity, b.sh)
+        # A viewer compiled with GEOM_PRIORS binds a one-element stub: it never reads the composite.
         self.geometry_forward = (GeometryForward(
             self.device, kernels, width=self.width, height=self.height, capacity=capacity,
-            plane_depth=self.geometry_config.depth_source == "plane") if self.geom_priors else None)
+            plane_depth=self.geometry_config.depth_source == "plane", stub=self.viewer_only)
+            if self.geom_priors else None)
         self.rasterizer = Rasterizer(
             self.device, commands, kernels, primitive=b.primitive, raster=b.raster,
             sh=b.sh, scan=self.scan, sort=self.sort, config=self.raster_config,
@@ -231,6 +247,8 @@ class TrainingPipeline:
             commands, kernels, primitive=b.primitive, adam=b.adam, gradients=b.gradients,
             sh=b.sh, cluster_visible=visible, capacity=capacity,
             width=self.width, height=self.height)
+        if self.geometry is not None and self.geometry.image_terms:
+            self.optimizer.extra_gradients = tuple(self.geometry.seeds.values())
         self.densify_stats = DensifyStatistics(
             commands, kernels, primitive=b.primitive, resources=b.densification,
             gradients=b.gradients, cluster_visible=visible, capacity=capacity,
@@ -314,6 +332,14 @@ class TrainingPipeline:
             records["opacity"] = opacity_logits
         self.primitives.write(records)
 
+    def allocated_bytes(self) -> dict[str, int]:
+        """Device bytes by field: GaussianBuffers plus the geometry terms' own buffers and textures."""
+        sizes = allocated_bytes(self.buffers)
+        for prefix, owner in (("geometry_forward", self.geometry_forward), ("geometry", self.geometry)):
+            if owner is not None:
+                sizes.update({f"{prefix}.{name}": size for name, size in owner.resource_bytes().items()})
+        return sizes
+
     def resize(self, max_splats: int, max_sort_pairs: int | None = None) -> None:
         """Re-allocate a render-only pipeline for ``max_splats``; contents are lost."""
         assert self.viewer_only, "resizing a training pipeline would drop its state"
@@ -322,6 +348,7 @@ class TrainingPipeline:
                                                                    num_tiles=_num_tiles(self.width, self.height))
         # Release the old set first so both never coexist in VRAM.
         self.buffers = self.scan = self.sort = self.primitives = self.rasterizer = None
+        self.geometry_forward = self.geometry = None
         self.buffers = buffers.allocate_viewer(
             device=self.device, shared_data_module=self.shared_data_module,
             **self._allocation_sizes())
@@ -335,6 +362,11 @@ class TrainingPipeline:
         self.rasterizer.record(camera, contextual)
 
     def record_loss(self, contextual: IterationContextualVariables) -> None:
+        stbn = contextual.contextual_stbn if contextual is not None else None
+        if (self.geometry is not None and self.geometry.image_terms and self.geometry.active
+                and stbn is not None and 0 < stbn.pixels_per_tile < TILE_AREA):
+            raise RuntimeError("an STBN-subsampled step with the depth/normal terms on: their seeds carry no STBN "
+                               "unbiasing scale, and their gradient needs every pixel's neighbours")
         self.targets.flush()
         self.loss.record(rendered=self.buffers.raster.output_image,
                          target=self.targets.active,

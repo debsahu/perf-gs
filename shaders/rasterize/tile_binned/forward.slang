@@ -32,9 +32,11 @@ void forwardRasterize(
     RWTexture2D<float4> output_image,
     RWTexture2D<uint> gaussian_count_per_pixel,
 #if GEOM_PRIORS
-    // Per-splat (n, s) from geom_features.slang, and their composite (N, S) per pixel.
+    // Per-splat (n, s) from geom_features.slang, and their composite (N, S) per pixel. aux_on = 0 skips the
+    // composite (the viewer, and steps before --geom-from): geom_data and aux_image are then never read or written.
     StructuredBuffer<float4> geom_data,
     RWTexture2D<float4> aux_image,
+    uniform uint aux_on,
 #endif
     uniform float extinction_hardness,
     // 0 for a render-only pipeline: no backward reads the checkpoints, and raster_checkpoints is a stub.
@@ -73,13 +75,23 @@ void forwardRasterize(
     float T[PIXELS_PER_THREAD];
     uint processed[PIXELS_PER_THREAD];
 #if GEOM_PRIORS
-    // Per-splat (n, s) from geom_features.slang, and their composite (N, S) per pixel.
-    StructuredBuffer<float4> geom_data,
-    RWTexture2D<float4> aux_image,
+    float4 aux[PIXELS_PER_THREAD];
+    if (aux_on != 0u)
+        blendForwardAux<GaussianSource, PIXELS_PER_THREAD>(
+            src, t_start, tile_count, pixel_center, valid_pixel,
+            pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
+            raster_checkpoints, extinction_hardness, geom_data, C, T, processed, aux, write_checkpoints != 0u);
+    else
+        blendForwardImpl<GaussianSource, PIXELS_PER_THREAD>(
+            src, t_start, tile_count, pixel_center, valid_pixel,
+            pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
+            raster_checkpoints, extinction_hardness, C, T, processed, write_checkpoints != 0u);
+#else
+    blendForwardImpl<GaussianSource, PIXELS_PER_THREAD>(
+        src, t_start, tile_count, pixel_center, valid_pixel,
+        pixel_in_tile, tile_bucket_base, sorted_gaussian_ids,
+        raster_checkpoints, extinction_hardness, C, T, processed, write_checkpoints != 0u);
 #endif
-    uniform float extinction_hardness,
-    // 0 for a render-only pipeline: no backward reads the checkpoints, and raster_checkpoints is a stub.
-    uniform uint write_checkpoints)
 
     [unroll]
     for (uint j = 0u; j < PIXELS_PER_THREAD; ++j)
@@ -90,7 +102,8 @@ void forwardRasterize(
         output_image[pixel[j]] = float4(C[j] * camera[0].lensGain(pixel[j]), 1.0 - T[j]);
         gaussian_count_per_pixel[pixel[j]] = processed[j];
 #if GEOM_PRIORS
-        aux_image[pixel[j]] = aux[j];   // no lens gain: geometry is not color
+        if (aux_on != 0u)
+            aux_image[pixel[j]] = aux[j];   // no lens gain: geometry is not color
 #endif
     }
 }

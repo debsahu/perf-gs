@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 import numpy as np
 from PIL import Image
 
-from trainer.backend.memory.budget import allocated_bytes
 from trainer.common.metrics import lossmask_view, psnr as psnr_image, ssim as ssim_image
 from trainer.frontend.run_control import Checkpoint, uninterrupted
 
@@ -80,7 +79,7 @@ def device_info(pipeline: "TrainingPipeline") -> dict:
 def gpu_allocation(pipeline: "TrainingPipeline") -> dict:
     """The trainer's own device allocations by field, as slangpy reports them.
     Machine-independent (``--max-splats``, frame size, SH degree); excludes driver overhead."""
-    by_field = allocated_bytes(pipeline.buffers)
+    by_field = pipeline.allocated_bytes()
     total = sum(by_field.values())
     return {
         "total_bytes": total,

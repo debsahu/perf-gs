@@ -209,7 +209,7 @@ python -m trainer.frontend.app --scene SCENE --preset quality \
 | `--normal-loss` | `l1` | `l1` over components, or `cos` (1 - cos) |
 | `--normal-encoding` | `slam` | 8-bit normal PNGs: `slam` code 128 is 0 and (128,128,128) is invalid; `spirula` black is invalid |
 | `--geom-min-alpha` | 0.5 | pixels with less rendered alpha get no image term |
-| `--geom-from` | 0 | first step of the three image terms |
+| `--geom-from` | 0 | first step of the three image terms; before it nothing is composited, decoded or uploaded |
 | `--geom-units-per-meter` | 1 | for scenes not in metres |
 
 **How it works.** A per-splat pass computes each splat's camera-frame normal (its smallest-scale axis, turned to
@@ -219,7 +219,10 @@ per-splat features, and never reaches opacity or the 2D footprint. The backward 
 no extra checkpoints. The image terms are means over their supervised pixels, scaled by 3WH, so a weight means what
 it means beside a per-pixel-mean L1 (this trainer sums its photometric loss over pixels). Flatten is a mean over live
 splats with the same scale. Counts and sums are exact integers or 64-bit fixed point, so they do not depend on
-thread order.
+thread order. A rendered depth under 1 mm is invalid (that bounds every disparity sum), and a plane depth over 10 km
+too; both limits are in metres, through `--geom-units-per-meter`. Only training views' priors are loaded. The live
+viewer binds a one-element stub for the geometry buffers and composites nothing; the trainer's geometry buffers are
+counted in the VRAM plan and the run report.
 
 **Priors.** Depth: 16-bit PNG in millimetres or float32 TIFF in metres, 0 = invalid. A saturated code 65535 is
 skipped as invalid. Normals: 8-bit RGB PNG or float32 3-channel TIFF, OpenCV camera frame, facing the camera. A
@@ -228,8 +231,10 @@ would smear the invalid code into valid pixels. Priors are held in host RAM as P
 ahead, in every image residency.
 
 **Load check.** On up to 8 views, at least 99% of valid normals must face the camera (dot with the pixel's own view
-ray below 0, never a test of n.z), at least half the map must be valid, and the 1st and 99th percentile of |n| must
-be within 0.02 of 1. A map that points away from the camera, or is read with the wrong encoding, stops the run.
+ray below 0, never a test of n.z), the 1st and 99th percentile of |n| must be within 0.02 of 1, and no |n| may
+exceed 1.1. A map that points away from the camera, or is read with the wrong encoding, stops the run. A map with no
+valid pixel stops it too; one under half valid only warns (partial maps are legitimate). A float TIFF with an
+orientation tag other than 1 is refused: the decoder would turn its pixels but not its normal vectors.
 
 **Not supported with these terms:** the per-pixel reference backward and STBN. Both are refused.
 

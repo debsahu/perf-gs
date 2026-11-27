@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 from trainer.config.config_types import DensificationMode
@@ -126,6 +127,8 @@ def validate_geometry(args: argparse.Namespace) -> None:
     for flag, value in weights.items():
         if not value >= 0.0:
             raise ConfigError(f"{flag} must be >= 0, got {value}.")
+        if not math.isfinite(value):
+            raise ConfigError(f"{flag} must be finite, got {value}.")
     for weight, folder, flag in (("--depth-loss-weight", "depth_dir", "--depth-dir"),
                                  ("--normal-loss-weight", "normal_dir", "--normal-dir")):
         has_dir = bool(g(args, folder, None))
@@ -138,9 +141,14 @@ def validate_geometry(args: argparse.Namespace) -> None:
     if image_terms and float(g(args, "stbn_pixel_fraction", 1.0)) < 1.0:
         raise ConfigError("depth/normal losses are not supported with STBN (--stbn-pixel-fraction < 1): "
                           "their gradient needs every pixel's neighbours.")
-    if not 0.0 < float(g(args, "geom_units_per_meter", 1.0)):
-        raise ConfigError("--geom-units-per-meter must be > 0.")
+    units = float(g(args, "geom_units_per_meter", 1.0))
+    if not (0.0 < units and math.isfinite(units)):
+        raise ConfigError(f"--geom-units-per-meter must be finite and > 0, got {units}.")
     if not 0.0 < float(g(args, "geom_min_alpha", 0.5)) <= 1.0:
         raise ConfigError("--geom-min-alpha must be in (0, 1].")
-    if int(g(args, "geom_from", 0)) < 0:
+    geom_from = int(g(args, "geom_from", 0))
+    if geom_from < 0:
         raise ConfigError("--geom-from must be >= 0.")
+    iters = int(g(args, "iters", 0) or 0)
+    if image_terms and iters > 0 and geom_from > iters:
+        raise ConfigError(f"--geom-from {geom_from} is past --iters {iters}: the depth/normal terms would never run.")

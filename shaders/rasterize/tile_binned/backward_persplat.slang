@@ -508,10 +508,13 @@ void backwardRasterizePerSplat(
 #if GEOM_PRIORS
             if (BACKWARD_PIXEL_STRIDE > 1u)
                 acc_aux *= float(BACKWARD_PIXEL_STRIDE);
-            geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
-            geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
-            geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
-            geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+            if (any(acc_aux != float4(0.0)))     // unsupervised (or before --geom-from): nothing to add
+            {
+                geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
+                geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
+                geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
+                geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+            }
 #endif
             if (track_blend_weight != 0u)
             {
@@ -871,10 +874,13 @@ void backwardRasterizePerBucket(
 #if GEOM_PRIORS
         if (BACKWARD_PIXEL_STRIDE > 1u)
             acc_aux *= float(BACKWARD_PIXEL_STRIDE);
-        geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
-        geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
-        geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
-        geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+        if (any(acc_aux != float4(0.0)))     // unsupervised (or before --geom-from): nothing to add
+        {
+            geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
+            geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
+            geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
+            geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+        }
 #endif
         if (track_blend_weight != 0u)
         {

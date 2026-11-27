@@ -285,7 +285,7 @@ class StructureSplitResources:
     split_factor_x: spy.NDBuffer
     split_factor_y: spy.NDBuffer
     split_factor_z: spy.NDBuffer
-    children_sum: spy.NDBuffer        # requested tail growth, read back for the overflow warning
+    children_sum: spy.NDBuffer        # requested tail growth (word 0) and a wrapped flag (word 1), for the warning
 
 
 @dataclass
@@ -600,7 +600,7 @@ def allocate(
             split_factor_x=allocator.uint_buffer("split_factor_x", max_splats),
             split_factor_y=allocator.uint_buffer("split_factor_y", max_splats),
             split_factor_z=allocator.uint_buffer("split_factor_z", max_splats),
-            children_sum=allocator.uint_buffer("densify_children_sum", 1),
+            children_sum=allocator.uint_buffer("densify_children_sum", 2),
         )
 
     sh = None

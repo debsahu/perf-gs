@@ -57,7 +57,8 @@ def test_budget_accounts_for_optional_structure_resources(device):
     sizes = dict(max_splats=7_000_000, width=16, height=16, max_sort_pairs=1024)
     simple = buffers.estimate_allocation_bytes(module, **sizes)
     structure = buffers.estimate_allocation_bytes(module, **sizes, structure_aware=True)
-    assert structure - simple == 7_000_000 * 60 + 4
+    # + 8: densify_children_sum is two words (the requested growth and its wrapped flag)
+    assert structure - simple == 7_000_000 * 60 + 8
 
 
 def test_only_training_camera_targets_are_uploaded(tmp_path, monkeypatch):

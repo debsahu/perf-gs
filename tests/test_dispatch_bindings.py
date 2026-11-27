@@ -60,3 +60,63 @@ def test_the_densify_path_binds_cleanly(gpu_device) -> None:
     _densify_structure(p, rank_split_families=True)
     assert _count(p) > 200
     assert np.isfinite(p.buffers.primitive.values.to_numpy().view(np.float32)).all()
+
+
+# ---------------------------------------------------------------- review regressions (no GPU)
+
+class _FakeKernel:
+    """A kernel-shaped object: the reflection check_bindings reads, nothing else."""
+
+    collected = 0
+
+    def __init__(self, params):
+        import slangpy as spy
+        from types import SimpleNamespace as NS
+        scalar = spy.TypeReflection.Kind.scalar
+        struct = spy.TypeReflection.Kind.resource
+        parameters = [NS(name=name, type_layout=NS(kind=scalar if system else struct, size=0 if system else 8))
+                      for name, system in params]
+        self.program = NS(layout=NS(entry_points=[NS(name="fake", parameters=parameters)]))
+
+    def __del__(self):
+        type(self).collected += 1
+
+
+def test_binding_cache_does_not_pin_every_kernel():
+    """The cache held a strong reference to every kernel (and so to its program and device) forever."""
+    import gc
+    from trainer.backend.compute import gpu
+    gpu._BINDINGS.clear()
+    _FakeKernel.collected = 0
+    bound = getattr(gpu, "BINDING_CACHE_SIZE", 1024)
+    n = bound + 300
+    for _ in range(n):
+        entry_point_bindings(_FakeKernel([("buf", False)]))
+    gc.collect()
+    assert _FakeKernel.collected >= n - bound, (_FakeKernel.collected, n)
+    assert len(gpu._BINDINGS) <= bound
+
+
+def test_hot_reload_refreshes_the_reflected_parameters(monkeypatch):
+    """After reload_all_programs the same kernel object can take different parameters: the pipeline's hot-reload
+    hook must drop the cached ones."""
+    from types import SimpleNamespace
+    from trainer.backend.compute import gpu
+    from trainer.backend.render import pipeline as pipeline_module
+    kernel = _FakeKernel([("old", False)])
+    assert entry_point_bindings(kernel)[0] == {"old"}
+    kernel.program.layout.entry_points[0].parameters[0].name = "new"
+    monkeypatch.setattr(pipeline_module, "_module_for_reflection", lambda *_a: None)
+    pipeline_module.TrainingPipeline.on_hot_reload(SimpleNamespace(device=None, slang_session=None))
+    assert entry_point_bindings(kernel)[0] == {"new"}
+    gpu.check_bindings(kernel, "m", {"new": 1})
+
+
+def test_a_system_value_or_an_indirect_thread_count_is_not_a_binding():
+    from trainer.backend.compute import gpu
+    kernel = _FakeKernel([("dtid", True), ("buf", False)])
+    gpu.check_bindings(kernel, "m", {"buf": 1, "thread_count": [1, 1, 1]})
+    with pytest.raises(BindingError, match="dtid"):
+        gpu.check_bindings(kernel, "m", {"buf": 1, "dtid": 0})
+    with pytest.raises(BindingError, match="thread_count"):
+        gpu.check_bindings(kernel, "m", {"buf": 1, "thread_count": [1, 1, 1]}, indirect=True)

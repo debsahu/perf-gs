@@ -10,6 +10,8 @@ static const uint ACTION_SPLIT = 1;
 static const uint ACTION_CLONE = 2;
 static const uint ACTION_PRUNE = 3;
 
+uint saturatingAdd(uint a, uint b) { return a > 0xFFFFFFFFu - b ? 0xFFFFFFFFu : a + b; }
+
 uint per_axis_split_factor(float eta_axis, float split_power, uint max_split_factor)
 {
     float e = max(eta_axis, 0.0);
@@ -110,9 +112,21 @@ void decideActionsStructure(
 
     // The requested growth only feeds the overbudget report: an integer sum, so its order
     // does not matter. The parent list is built in index order by allocate_children.slang.
-    uint requested = out_action == ACTION_SPLIT ? gridSize(nkx, nky, nkz) - 1u
+    // Each request is capped at max_splats, as structureGrowth caps it (more could never be placed). The sum must
+    // not wrap into "within budget": every add is positive, so the true sum reaches 2**32 exactly when some add
+    // wraps the running counter, and that add sets word 1, which the host reads as a saturated 0xFFFFFFFF. One
+    // atomic add per wave, as before (a compare-exchange loop on the one word doubled the tick). The wave sum is
+    // taken in 16-bit halves so it cannot wrap either (a wave of 64 lanes sums at most 64 * 0xFFFF per half).
+    uint requested = out_action == ACTION_SPLIT ? min(gridSize(nkx, nky, nkz) - 1u, max_splats)
                    : (out_action == ACTION_CLONE ? 1u : 0u);
-    uint wave_growth = WaveActiveSum(requested);
-    if (WaveIsFirstLane() && wave_growth > 0u)
-        InterlockedAdd(densify_children_sum[0], wave_growth);
+    uint wave_hi = WaveActiveSum(requested >> 16u);
+    uint wave_lo = WaveActiveSum(requested & 0xFFFFu);
+    if (WaveIsFirstLane() && (wave_hi | wave_lo) != 0u)
+    {
+        uint add = wave_hi >= 0x10000u ? 0xFFFFFFFFu : saturatingAdd(wave_hi << 16u, wave_lo);
+        uint before;
+        InterlockedAdd(densify_children_sum[0], add, before);
+        if (before > 0xFFFFFFFFu - add || add == 0xFFFFFFFFu)
+            InterlockedOr(densify_children_sum[1], 1u);
+    }
 }

@@ -6,9 +6,11 @@
 static const uint BINS = 256u;
 static const uint CUTOFF = 2u * BINS, REMAINING = CUTOFF + 1u;
 
-// Eight buckets per power of two keep ranking inexpensive at a densification tick.
+// Eight buckets per power of two keep ranking inexpensive at a densification tick. A score that is not positive
+// (or is NaN) is the lowest priority: its bits would otherwise read as a huge exponent (sign bit, NaN exponent).
 uint priorityBin(float score)
 {
+    if (!(score > 0.0)) return 0u;
     return uint(clamp(int(asuint(score) >> 20u) - (127 - 16) * 8, 0, int(BINS) - 1));
 }
 

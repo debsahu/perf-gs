@@ -119,7 +119,8 @@ class StructureDensifier:
         """
         self._record_densify(cfg, min_blend_weight, tick)
         self._commands.runtime.wait_for_submit(self._commands.last_submit_id)
-        children = int(self._split_resources.children_sum.storage.to_numpy().view(np.uint32)[0])
+        words = self._split_resources.children_sum.storage.to_numpy().view(np.uint32)
+        children = 0xFFFFFFFF if words[1] else int(words[0])      # word 1: the sum passed 2**32
         pre_count = int(self._densification_resources.pre_count.storage.to_numpy().view(np.uint32)[0])
         headroom = max(self._capacity - pre_count, 0)
         overbudget = children > headroom
@@ -135,7 +136,7 @@ class StructureDensifier:
             if cfg.detailed_diagnostics:
                 self._print_gate_breakdown(cfg, pre_count)
         return {"pre_count": None, "post_split_count": None, "final_count": None,
-                "overbudget": overbudget}
+                "overbudget": overbudget, "requested_children": children}
 
     def _grad_threshold(self, cfg: StructureConfig) -> float:
         # Same convention scaling as the simple densifier.
@@ -149,7 +150,7 @@ class StructureDensifier:
 
         with commands.recording("densify_structure"), commands.marker_group("densify_structure"):
             commands.dispatch(k.clear_uint, "clear_children_sum",
-                thread_count=[1, 1, 1], buffer=split.children_sum.storage, count=1)
+                thread_count=[2, 1, 1], buffer=split.children_sum.storage, count=2)
             commands.dispatch(k.clear_uint, "clear_selected_count",
                 thread_count=[1, 1, 1], buffer=selected_count.storage, count=1)
             commands.dispatch(k.snapshot_count, "densify_snapshot",

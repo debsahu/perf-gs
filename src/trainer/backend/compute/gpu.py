@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Callable
@@ -26,34 +27,47 @@ class BindingError(TypeError):
     """A dispatch's keyword arguments do not match its entry point's parameters."""
 
 
-_BINDINGS: dict[int, tuple[frozenset[str], frozenset[str], str]] = {}
+# Reflected parameters per kernel. A ComputeKernel takes no weak reference, so the cache holds the kernel itself
+# (and through it its program and device): it is bounded, least recently used out first, and cleared on hot reload.
+BINDING_CACHE_SIZE = 1024
+_BINDINGS: OrderedDict[int, tuple[frozenset[str], frozenset[str], object]] = OrderedDict()
+
+
+def clear_binding_cache() -> None:
+    """Forget every kernel's reflected parameters (``device.reload_all_programs()`` can change them in place)."""
+    _BINDINGS.clear()
 
 
 def entry_point_bindings(kernel) -> tuple[frozenset[str], frozenset[str]]:
-    """(required, all) parameter names of the kernel's entry point. System values (scalar or
-    vector parameters that take no uniform space, e.g. SV_DispatchThreadID) are not bindable."""
+    """(required, bindable) parameter names of the kernel's entry point. System values (scalar or
+    vector parameters that take no uniform space, e.g. SV_DispatchThreadID) are neither."""
     cached = _BINDINGS.get(id(kernel))
-    if cached is None or cached[2] is not kernel:
-        ep = kernel.program.layout.entry_points[0]
-        names, required = set(), set()
-        for i in range(len(ep.parameters)):
-            param = ep.parameters[i]
-            layout = param.type_layout
-            system = (layout.kind in (spy.TypeReflection.Kind.scalar, spy.TypeReflection.Kind.vector)
-                      and layout.size == 0)
-            if not system:
-                required.add(param.name)
-            names.add(param.name)
-        cached = (frozenset(required), frozenset(names), kernel)
-        _BINDINGS[id(kernel)] = cached
+    if cached is not None and cached[2] is kernel:
+        _BINDINGS.move_to_end(id(kernel))
+        return cached[0], cached[1]
+    ep = kernel.program.layout.entry_points[0]
+    bindable = set()
+    for i in range(len(ep.parameters)):
+        param = ep.parameters[i]
+        layout = param.type_layout
+        system = (layout.kind in (spy.TypeReflection.Kind.scalar, spy.TypeReflection.Kind.vector)
+                  and layout.size == 0)
+        if not system:
+            bindable.add(param.name)
+    cached = (frozenset(bindable), frozenset(bindable), kernel)
+    _BINDINGS[id(kernel)] = cached
+    _BINDINGS.move_to_end(id(kernel))
+    while len(_BINDINGS) > BINDING_CACHE_SIZE:
+        _BINDINGS.popitem(last=False)
     return cached[0], cached[1]
 
 
-def check_bindings(kernel, marker: str, kwargs: dict) -> None:
-    """Raise BindingError when kwargs miss a parameter or name one the entry point lacks:
-    Slang would leave a missing one zero and silently ignore an extra one."""
+def check_bindings(kernel, marker: str, kwargs: dict, *, indirect: bool = False) -> None:
+    """Raise BindingError when kwargs miss a parameter or name one the entry point does not take (a system value
+    is not one): Slang would leave a missing one zero and silently ignore an extra one. ``thread_count`` sizes a
+    direct dispatch; an indirect one reads its size from the argument buffer, so there it is an error too."""
     required, names = entry_point_bindings(kernel)
-    given = set(kwargs) - {"thread_count"}
+    given = set(kwargs) - (set() if indirect else {"thread_count"})
     missing, extra = required - given, given - names
     if missing or extra:
         entry = kernel.program.layout.entry_points[0].name
@@ -89,7 +103,7 @@ class CommandBatch:
 
         No barrier before the fetch: sgl's resource tracking covers the ``args_buf`` write.
         """
-        check_bindings(kernel, marker, kwargs)
+        check_bindings(kernel, marker, kwargs, indirect=True)
         self._encoder.insert_debug_marker(marker, spy.math.float3(*marker_color(marker)))
         pass_enc = self._encoder.begin_compute_pass()
         try:

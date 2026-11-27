@@ -84,7 +84,7 @@ void splitAndClone(
     uniform uint max_splats)
 {
     uint i = dtid.x;
-    uint pre_count = pre_count_buf[0];
+    uint pre_count = min(pre_count_buf[0], max_splats);   // as allocate_children and split_anisotropic clamp it
     if (i >= pre_count) return;
 
     uint a = action[i];
@@ -138,7 +138,7 @@ void splitAndCloneSH(
     uniform uint max_splats)
 {
     uint i = dtid.x;
-    uint pre_count = pre_count_buf[0];
+    uint pre_count = min(pre_count_buf[0], max_splats);   // as allocate_children and split_anisotropic clamp it
     if (i >= pre_count) return;
 
     uint a = action[i];

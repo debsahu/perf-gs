@@ -13,7 +13,7 @@ import slangpy as spy
 from trainer.backend.compute.algorithms import PrefixScan, RadixSort
 from trainer.backend.compute.device import SHADERS_DIR, define_enabled
 from trainer.backend.compute.execution import TILE_AREA, TILE_HEIGHT, TILE_WIDTH
-from trainer.backend.compute.gpu import CommandRecorder, GpuRuntime
+from trainer.backend.compute.gpu import CommandRecorder, GpuRuntime, clear_binding_cache
 from trainer.backend.compute.kernels import KernelLibrary
 from trainer.backend.densify.morton import MortonReorder
 from trainer.backend.densify.opacity import OpacityReset
@@ -355,7 +355,8 @@ class TrainingPipeline:
         self._build_components()
 
     def on_hot_reload(self) -> None:
-        """Refresh the reflection module after ``device.reload_all_programs()``."""
+        """Refresh the reflection module and the dispatch binding cache after ``device.reload_all_programs()``."""
+        clear_binding_cache()
         self.shared_data_module = _module_for_reflection(self.device, self.slang_session)
 
     def record_forward(self, camera: Camera, contextual: IterationContextualVariables) -> None:

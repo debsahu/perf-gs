@@ -579,3 +579,79 @@ def test_hash_thinning_repeats_and_never_exceeds_the_cap(gpu_device) -> None:
         values = p.buffers.primitive.values.to_numpy().view(np.uint8).reshape(cap, -1)[:count]
         results.add((count, values.tobytes()))
     assert len(results) == 1
+
+
+# ---------------------------------------------------------------- review regressions
+
+def _set_axis_eta(p, cap, values):
+    for k, axis in enumerate(("max_x", "max_y", "max_z")):
+        e = np.zeros(cap, np.uint32)
+        for i, v in enumerate(values):
+            e[i] = min(int(v[k] * 65536), 0xFFFFFFFF)
+        p.buffers.eta.components[axis].copy_from_numpy(e)
+
+
+def test_overbudget_is_reported_when_the_requested_sum_would_wrap(gpu_device) -> None:
+    """Two 2048 x 1024 x 1024 splits request 2**31 - 1 children each and two clones 1 each: 2**32 in all, which
+    wrapped to 0 and reported 'within budget' at a 600-splat cap. Each request is capped at the cap, as the slot
+    allocation caps it, and the sum saturates."""
+    cap = 600
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, 4, seed=1, clone_fraction=0, keep_fraction=0)
+    scales = np.log(np.array([[0.3] * 3, [0.3] * 3, [0.02] * 3, [0.02] * 3], np.float32))
+    g = _read_gaussians(p, 4)
+    p.set_primitive_from_numpy(means=g[:, :3].copy(), log_scales=scales,
+                               rot_quats=np.tile(np.array([1, 0, 0, 0], np.float32), (4, 1)),
+                               opacities=np.full(4, 0.7, np.float32), color_logits=np.zeros((4, 3), np.float32))
+    _set_axis_eta(p, cap, [(2048, 1024, 1024), (2048, 1024, 1024), (2, 2, 2), (2, 2, 2)])
+    result = _densify_structure(p, max_split_factor=2048, split_power=1.0)
+    actions = _u32(p.buffers.structure.action, 4) if hasattr(p.buffers.structure, "action") else None
+    factors = [[int(_u32(getattr(p.buffers.structure, f"split_factor_{a}"), 2)[i]) for a in "xyz"] for i in range(2)]
+    assert factors == [[2048, 1024, 1024]] * 2 and (actions is None or list(actions[2:]) == [2, 2])
+    requested = result["requested_children"]
+    assert result["overbudget"] is True
+    assert requested == 2 * cap + 2                     # min(2**31 - 1, cap) per split, 1 per clone
+
+
+def test_child_grid_index_does_not_divide_by_a_wrapped_product(gpu_device) -> None:
+    """With 65536 x 65536 x 1 factors, n.x * n.y wraps to 0 in 32 bits and ordinal / (n.x * n.y) divides by zero:
+    the children's z index came out as garbage. n.z = 1, so every child must sit at the parent's z."""
+    cap = 3000
+    p = _setup(gpu_device, max_splats=cap)
+    parent = _population(p, 1, seed=1, clone_fraction=0, keep_fraction=0)[0]
+    _set_axis_eta(p, cap, [(65535.99, 65535.99, 1.0)])
+    _densify_structure(p, max_split_factor=65536, split_power=1.0)
+    factors = [int(_u32(getattr(p.buffers.structure, f"split_factor_{a}"), 1)[0]) for a in "xyz"]
+    assert factors == [65536, 65536, 1]
+    count = _count(p)
+    children = _read_gaussians(p, count)
+    assert count == cap and np.isfinite(children).all()
+    np.testing.assert_allclose(children[:, 2], parent[2], atol=1e-4)
+
+
+def test_priority_bin_puts_non_positive_and_nan_scores_last(gpu_device) -> None:
+    """asuint(score) >> 20 has the sign bit set for a negative score and a high exponent for NaN: both landed in
+    the top bin, ahead of every real score."""
+    import slangpy as spy
+    from trainer.backend.compute.device import SHADERS_DIR
+    source = ('#include "densify/rank_families.slang"\n'
+              'uint bin(float score) { return priorityBin(score); }\n')
+    module = spy.Module.load_from_source(gpu_device, "priority_bin_probe", source)
+    del SHADERS_DIR
+    scores = [-1.0, -1e-30, 0.0, float("nan"), 1e-3, 1.0, 1e3, float("inf")]
+    bins = [int(module.bin(s)) for s in scores]
+    assert bins[:4] == [0, 0, 0, 0], bins
+    assert 0 < bins[4] < bins[5] < bins[6] <= 255
+
+
+def test_requested_children_saturate_past_32_bits(gpu_device) -> None:
+    """70,000 parents at a 70,000 cap, each capped at the cap: 4.9e9 children, past 2**32 even after the per-parent
+    cap. The report saturates at 0xFFFFFFFF instead of wrapping to a smaller number."""
+    cap = 70_000
+    p = _setup(gpu_device, max_splats=cap)
+    _population(p, cap, seed=1, clone_fraction=0, keep_fraction=0)
+    _set_axis_eta(p, cap, [(2048, 1024, 1024)] * cap)
+    assert cap * cap > 2**32
+    result = _densify_structure(p, max_split_factor=2048, split_power=1.0)
+    assert result["requested_children"] == 0xFFFFFFFF
+    assert result["overbudget"] is True

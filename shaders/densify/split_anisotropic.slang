@@ -44,7 +44,8 @@ ChildGrid prepareChildGrid(Gaussian3D parent, uint3 factors, float ks_scale_powe
 Gaussian3D gridChild(ChildGrid grid, uint ordinal)
 {
     uint3 n = grid.factors;
-    uint3 idx = uint3(ordinal % n.x, (ordinal / n.x) % n.y, ordinal / (n.x * n.y));
+    // (ordinal / n.x) / n.y, never ordinal / (n.x * n.y): the product wraps (to 0 at 65536 x 65536) in 32 bits.
+    uint3 idx = uint3(ordinal % n.x, (ordinal / n.x) % n.y, (ordinal / n.x) / n.y);
     float3 coord = float3(idx) - 0.5 * float3(n - uint3(1u));
     Gaussian3D child = grid.child;
     child.mean += mul(grid.rotation, coord * grid.separation);

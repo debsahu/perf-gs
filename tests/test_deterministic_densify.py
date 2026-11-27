@@ -311,15 +311,18 @@ def _owner_check(p, n, cap):
     return total
 
 
-@pytest.mark.parametrize("cap", [3_500_000, 6_000_000], ids=["cap-binds", "roomy"])
-def test_three_level_scan_layout(gpu_device, cap) -> None:
-    """1.15M parents: the prefix sum needs three levels and parents sit past index 1,048,576."""
+@pytest.mark.parametrize("cap,keep_fraction", [(3_500_000, 0.2), (2_000_000, 0.85)], ids=["cap-binds", "roomy"])
+def test_three_level_scan_layout(gpu_device, cap, keep_fraction) -> None:
+    """1.15M splats: the prefix sum needs three levels and parents sit past index 1,048,576. The roomy case
+    triggers fewer parents instead of a bigger cap, so it fits an 8 GB GPU."""
     n = 1_150_000
     p = _setup(gpu_device, max_splats=cap)
-    _population(p, n, seed=11)
+    _population(p, n, seed=11, keep_fraction=keep_fraction)
     _densify_structure(p)
     total = _owner_check(p, n, cap)
     assert (n + total > cap) == (cap == 3_500_000)
+    actions = _u32(p.buffers.densification.actions, n)
+    assert np.flatnonzero((actions == 1) | (actions == 2)).max() > 1_048_576
 
 
 @pytest.mark.parametrize("cap", [4000, 1500], ids=["roomy", "cap-full"])

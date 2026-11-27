@@ -138,6 +138,51 @@ def build_parser() -> argparse.ArgumentParser:
                          "Exclusive with --w-alpha > 0 (the mask is stored in the target's alpha).")
     parser.add_argument("--invert-masks", action="store_true",
                     help="the --masks files use 255 = drop (0 = keep)")
+    geometry = parser.add_argument_group(
+        "depth and normal priors",
+        "All off by default. Weights are Brush-equivalent: each image term is a mean over its "
+        "supervised pixels, scaled to sit beside a per-pixel-mean L1 (this trainer sums its "
+        "photometric loss over pixels). The image terms move means and rotations only: the blend "
+        "weights are constants for them, so opacity and 2D footprints get no gradient from them.")
+    geometry.add_argument("--depth-dir", type=str, default=None,
+                    help="depth priors, <DIR>/<image name>.<ext> or <DIR>/<stem>.<ext> (png, tiff, tif): "
+                         "16-bit PNG in millimetres or float32 TIFF in metres, 0 = invalid. Any grid "
+                         "with the image's aspect (sampled nearest). Saturated code 65535 (>= 65.535 m) "
+                         "is skipped as invalid. A depth/ folder beside images/ is never picked up "
+                         "by itself.")
+    geometry.add_argument("--normal-dir", type=str, default=None,
+                    help="normal priors, same naming: 8-bit RGB PNG or float32 3-channel TIFF, camera "
+                         "frame (OpenCV), facing the camera. Checked at load: a map that points away "
+                         "from the camera is refused.")
+    geometry.add_argument("--normal-encoding", choices=["slam", "spirula"], default="slam",
+                    help="8-bit normal PNGs: slam = code 128 decodes to 0, (128,128,128) invalid; "
+                         "spirula = same map, black (0,0,0) invalid. Default slam.")
+    geometry.add_argument("--depth-loss-weight", type=float, default=0.0,
+                    help="depth prior loss weight (needs --depth-dir). Default 0 = off.")
+    geometry.add_argument("--normal-loss-weight", type=float, default=0.0,
+                    help="normal prior loss weight (needs --normal-dir). Default 0 = off.")
+    geometry.add_argument("--depth-normal-weight", type=float, default=0.0,
+                    help="depth-normal consistency weight: rendered normal vs the normal of the rendered "
+                         "depth. Needs no prior. Default 0 = off.")
+    geometry.add_argument("--flatten-loss-weight", type=float, default=0.0,
+                    help="mean of each splat's smallest scale (metres): pushes splats toward discs. "
+                         "Needs no prior. Default 0 = off.")
+    geometry.add_argument("--depth-source", choices=["center", "plane"], default="center",
+                    help="rendered depth: center = blended camera-frame z of the means; plane = the "
+                         "pixel ray meets the blended splat plane. Default center.")
+    geometry.add_argument("--depth-loss-space", choices=["disparity", "metric", "ssi"], default="disparity",
+                    help="depth residual: disparity 1/D - 1/Dg (default), metric D - Dg, or ssi "
+                         "1/D - (a/Dg + b) with a per-frame least-squares (a, b) held constant.")
+    geometry.add_argument("--normal-loss", choices=["l1", "cos"], default="l1",
+                    help="normal prior error: l1 over components (default) or 1 - cos.")
+    geometry.add_argument("--geom-min-alpha", type=float, default=0.5,
+                    help="pixels with rendered alpha below this get no depth/normal/depth-normal "
+                         "term (default 0.5).")
+    geometry.add_argument("--geom-from", type=int, default=0,
+                    help="first iteration the depth, normal and depth-normal terms are on (default 0).")
+    geometry.add_argument("--geom-units-per-meter", type=float, default=1.0,
+                    help="scene units per metre, for the metric-dimensioned terms (depth residuals, "
+                         "the flatten scale) on scenes not in metres (default 1).")
     _shared(parser, "lambda_ssim")
     _shared(parser, "max_splats")
     _shared(parser, "final_splat_fraction")

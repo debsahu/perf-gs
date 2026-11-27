@@ -40,6 +40,8 @@ def shader_defines(spec: ShaderSpecialization) -> dict[str, str] | None:
         defines["SPLAT_PROFILE_ONSET"] = repr(float(spec.splat_profile_onset))
     if spec.loss_mask:
         defines["LOSS_MASK"] = "1"
+    if spec.geom_priors:
+        defines["GEOM_PRIORS"] = "1"
     return defines or None
 
 
@@ -101,6 +103,7 @@ def create_pipeline(*, device: spy.Device, gpu_lock: Any, scene: SceneContext,
         regularization_config=config.regularization,
         appearance_config=config.appearance,
         stbn_config=config.stbn,
+        geometry_config=config.geometry,
         initial_state=initial_state,
         densify_mode=config.densify_mode,
         slang_session=slang_session,

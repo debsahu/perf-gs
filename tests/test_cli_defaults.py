@@ -151,6 +151,20 @@ EXPECTED_DEFAULTS = {
     "eval_iters": None,
     "eval_lpips": False,
     "write_ground_truths": False,
+    # Depth and normal priors: every term off, no prior folder picked up by itself.
+    "depth_dir": None,
+    "normal_dir": None,
+    "normal_encoding": "slam",
+    "depth_loss_weight": 0.0,
+    "normal_loss_weight": 0.0,
+    "depth_normal_weight": 0.0,
+    "flatten_loss_weight": 0.0,
+    "depth_source": "center",
+    "depth_loss_space": "disparity",
+    "normal_loss": "l1",
+    "geom_min_alpha": 0.5,
+    "geom_from": 0,
+    "geom_units_per_meter": 1.0,
 }
 
 

@@ -186,6 +186,58 @@ Select **Quality+** in the hub or add `--preset quality+` to the training comman
 
 <a id="rtx-4050-laptop-gpu-on-truck"></a>
 
+## Depth and normal priors
+
+Optional geometry losses, all off by default. Without these flags training is unchanged.
+
+```bash
+python -m trainer.frontend.app --scene SCENE --preset quality \
+    --normal-dir NORMALS --normal-loss-weight 0.2 \
+    --depth-dir DEPTH --depth-loss-weight 1.0 \
+    --depth-normal-weight 0.05 --flatten-loss-weight 1.0
+```
+
+| flag | default | what it does |
+|---|---|---|
+| `--depth-dir`, `--normal-dir` | none | prior folders, `<dir>/<image name>.<ext>` or `<dir>/<stem>.<ext>` |
+| `--depth-loss-weight` | 0 | depth prior term (needs `--depth-dir`) |
+| `--normal-loss-weight` | 0 | normal prior term (needs `--normal-dir`) |
+| `--depth-normal-weight` | 0 | rendered normal vs the normal of the rendered depth; no prior |
+| `--flatten-loss-weight` | 0 | mean of each splat's smallest scale; no prior |
+| `--depth-source` | `center` | `center`: blended z of the means. `plane`: the pixel ray meets the blended splat plane |
+| `--depth-loss-space` | `disparity` | `disparity` 1/D - 1/Dg, `metric` D - Dg, `ssi` 1/D - (a/Dg + b) with a per-frame fit |
+| `--normal-loss` | `l1` | `l1` over components, or `cos` (1 - cos) |
+| `--normal-encoding` | `slam` | 8-bit normal PNGs: `slam` code 128 is 0 and (128,128,128) is invalid; `spirula` black is invalid |
+| `--geom-min-alpha` | 0.5 | pixels with less rendered alpha get no image term |
+| `--geom-from` | 0 | first step of the three image terms |
+| `--geom-units-per-meter` | 1 | for scenes not in metres |
+
+**How it works.** A per-splat pass computes each splat's camera-frame normal (its smallest-scale axis, turned to
+face the camera along the splat's own view ray) and its depth. The forward composites both with the color's blend
+weights. For these terms the weights are constants. So the gradient reaches the means and rotations through the
+per-splat features, and never reaches opacity or the 2D footprint. The backward needs four more sums per splat and
+no extra checkpoints. The image terms are means over their supervised pixels, scaled by 3WH, so a weight means what
+it means beside a per-pixel-mean L1 (this trainer sums its photometric loss over pixels). Flatten is a mean over live
+splats with the same scale. Counts and sums are exact integers or 64-bit fixed point, so they do not depend on
+thread order.
+
+**Priors.** Depth: 16-bit PNG in millimetres or float32 TIFF in metres, 0 = invalid. A saturated code 65535 is
+skipped as invalid. Normals: 8-bit RGB PNG or float32 3-channel TIFF, OpenCV camera frame, facing the camera. A
+prior keeps its own grid, which must have its image's aspect, and is sampled nearest at the pixel center. Bilinear
+would smear the invalid code into valid pixels. Priors are held in host RAM as PNG bytes and decoded a few views
+ahead, in every image residency.
+
+**Load check.** On up to 8 views, at least 99% of valid normals must face the camera (dot with the pixel's own view
+ray below 0, never a test of n.z), at least half the map must be valid, and the 1st and 99th percentile of |n| must
+be within 0.02 of 1. A map that points away from the camera, or is read with the wrong encoding, stops the run.
+
+**Not supported with these terms:** the per-pixel reference backward and STBN. Both are refused.
+
+Tests: `tests/test_geometry_priors.py` (GPU: loss gradients against central differences of a float64 reference,
+the backward against weights read back from the forward, the feature chain against host differences, flatten,
+resolution independence, forward and no-flag identity) and `tests/test_geometry_loader.py` (formats, encodings,
+the load check, the grid, the streamed cache).
+
 ## RTX 4050 Laptop GPU
 
 On a Dell XPS 14 9440 with a 6 GB RTX 4050 Laptop GPU and a 30 W enforced power limit, we tested the three presets at seed 42. The three datasets contributed 246 held-out views from nine Mip-NeRF 360 scenes, 70 from Train and Truck, and 62 from DrJohnson and Playroom. Each row gives equal weight to its completed scenes.

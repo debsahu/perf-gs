@@ -11,6 +11,7 @@
 #include "../../core/compositor.slang"
 #include "../../common/stbn.slang"
 #include "../../common/loss_mask.slang"
+#include "../../common/geom_priors.slang"
 #include "checkpoint.slang"
 
 #include "common/execution.slang"
@@ -131,6 +132,9 @@ groupshared uint   gs_processed[TILE_AREA];
 #if LOSS_MASK
 groupshared float  gs_keep[TILE_AREA];   // loss mask of the pixel: 1 keep, 0 drop
 #endif
+#if GEOM_PRIORS
+groupshared float4 gs_dLdAux[TILE_AREA]; // dL/d(N, S) of the pixel
+#endif
 groupshared uint   gs_max_processed;     // deepest splat any pixel processed
 
 // Per-warp LDS stage of the bucket's checkpoints for visited pixels only: slot k = (p - phase) / STRIDE.
@@ -182,6 +186,15 @@ void backwardRasterizePerSplat(
     uniform uint track_screen_grad,
     // Visited pixel subset in [0, BACKWARD_PIXEL_STRIDE); the host rotates it per iteration.
     uniform uint pixel_phase,
+#if GEOM_PRIORS
+    // dL/d(N, S) per pixel from losses/geom_loss.slang, and the per-splat seeds it sums into.
+    // The blend weights are constants for these terms: nothing here reaches dL_dalpha.
+    RWTexture2D<float4> dL_dAux,
+    RWStructuredBuffer<uint2> grad_geom_nx,
+    RWStructuredBuffer<uint2> grad_geom_ny,
+    RWStructuredBuffer<uint2> grad_geom_nz,
+    RWStructuredBuffer<uint2> grad_geom_s,
+#endif
 #if LOSS_MASK
     // The active target; .a is the loss keep mask. Only the blend-weight sum reads it: the color
     // gradient of a dropped pixel is already zero in dL_dC.
@@ -249,6 +262,9 @@ void backwardRasterizePerSplat(
 #if LOSS_MASK
         gs_keep[tid]      = loss_mask[my_pixel].a;
 #endif
+#if GEOM_PRIORS
+        gs_dLdAux[tid]    = dL_dAux[my_pixel];
+#endif
     }
     else
     {
@@ -258,6 +274,9 @@ void backwardRasterizePerSplat(
         gs_processed[tid] = 0u;   // no splat contributes to an OOB pixel
 #if LOSS_MASK
         gs_keep[tid]      = 0.0;
+#endif
+#if GEOM_PRIORS
+        gs_dLdAux[tid]    = float4(0.0);
 #endif
     }
     GroupMemoryBarrierWithGroupSync();
@@ -306,6 +325,9 @@ void backwardRasterizePerSplat(
         float  acc_absx = 0.0;
         float  acc_absy = 0.0;
         float  acc_weight = 0.0;
+#if GEOM_PRIORS
+        float4 acc_aux = float4(0.0);
+#endif
 
         // Same GaussianPrimitive as the forward; masked lanes get a finite zero prim.
         GaussianPrimitive prim = splat_valid ? GaussianPrimitive.make(blend_only_data)
@@ -424,6 +446,9 @@ void backwardRasterizePerSplat(
 
                 // shDC is affine, so the color seed is summed here and scaled by SH_C0 after the loop.
                 acc_color += dL_dC * alpha_T;
+#if GEOM_PRIORS
+                acc_aux += gs_dLdAux[p] * alpha_T;   // detached weights: no dL_dalpha term
+#endif
 #if LOSS_MASK
                 acc_weight += alpha_T * gs_keep[p];   // dropped pixels do not keep a splat alive
 #else
@@ -480,6 +505,14 @@ void backwardRasterizePerSplat(
                 acc_absy *= s;
                 acc_weight *= s;
             }
+#if GEOM_PRIORS
+            if (BACKWARD_PIXEL_STRIDE > 1u)
+                acc_aux *= float(BACKWARD_PIXEL_STRIDE);
+            geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
+            geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
+            geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
+            geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+#endif
             if (track_blend_weight != 0u)
             {
                 // STBN visited visit_count of the tile's pixels; scale to all.
@@ -546,6 +579,15 @@ void backwardRasterizePerBucket(
     uniform uint track_blend_weight,
     uniform uint track_screen_grad,
     uniform uint pixel_phase,
+#if GEOM_PRIORS
+    // dL/d(N, S) per pixel from losses/geom_loss.slang, and the per-splat seeds it sums into.
+    // The blend weights are constants for these terms: nothing here reaches dL_dalpha.
+    RWTexture2D<float4> dL_dAux,
+    RWStructuredBuffer<uint2> grad_geom_nx,
+    RWStructuredBuffer<uint2> grad_geom_ny,
+    RWStructuredBuffer<uint2> grad_geom_nz,
+    RWStructuredBuffer<uint2> grad_geom_s,
+#endif
 #if LOSS_MASK
     RWTexture2D<float4> loss_mask,
 #endif
@@ -644,6 +686,9 @@ void backwardRasterizePerBucket(
     float  acc_absx = 0.0;
     float  acc_absy = 0.0;
     float  acc_weight = 0.0;
+#if GEOM_PRIORS
+    float4 acc_aux = float4(0.0);
+#endif
 
     GaussianPrimitive prim = splat_valid ? GaussianPrimitive.make(blend_only_data)
                                          : GaussianPrimitive.none();
@@ -769,6 +814,9 @@ void backwardRasterizePerBucket(
                 float  T_final = 1.0 - C_total[j].a;
 
                 acc_color += dLdC4[j].rgb * alpha_T;
+#if GEOM_PRIORS
+                acc_aux += dL_dAux[pixel[j]] * alpha_T;   // detached weights: no dL_dalpha term
+#endif
 #if LOSS_MASK
                 acc_weight += alpha_T * loss_mask[pixel[j]].a;   // dropped pixels do not keep a splat alive
 #else
@@ -820,6 +868,14 @@ void backwardRasterizePerBucket(
             acc_absy *= s;
             acc_weight *= s;
         }
+#if GEOM_PRIORS
+        if (BACKWARD_PIXEL_STRIDE > 1u)
+            acc_aux *= float(BACKWARD_PIXEL_STRIDE);
+        geomAtomicAdd(grad_geom_nx, g_idx, geomToFixed(acc_aux.x));
+        geomAtomicAdd(grad_geom_ny, g_idx, geomToFixed(acc_aux.y));
+        geomAtomicAdd(grad_geom_nz, g_idx, geomToFixed(acc_aux.z));
+        geomAtomicAdd(grad_geom_s, g_idx, geomToFixed(acc_aux.w));
+#endif
         if (track_blend_weight != 0u)
         {
             float coverage = float(TILE_AREA) / float(max(visit_count, 1u));

@@ -18,6 +18,8 @@ class ColmapImageEntry:
     image_id: int
     image_name: str
     camera: Camera
+    # The image's own (COLMAP camera) size; views are stretched to the training size per axis.
+    native_size: tuple[int, int] | None = None
 
 
 @dataclass
@@ -322,6 +324,7 @@ def load_colmap(
         )
         image_entries.append(ColmapImageEntry(
             image_id=rec["image_id"], image_name=rec["name"], camera=camera,
+            native_size=(int(cam["width"]), int(cam["height"])),
         ))
 
     n = pts3d.shape[0]

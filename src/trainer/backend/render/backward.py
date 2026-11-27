@@ -53,7 +53,7 @@ class RasterBackward:
                  tracking: DensificationResources,
                  sh: SphericalHarmonicsResources | None, scan: PrefixScan,
                  capacity: int, max_sort_pairs: int, per_splat: bool = True,
-                 per_bucket: bool = True, stbn_compacted: bool = False) -> None:
+                 per_bucket: bool = True, stbn_compacted: bool = False, geometry=None) -> None:
         assert per_splat or not per_bucket, \
             "use_flat_bucket_backward=True requires use_persplat_backward=True"
         if rasterizer.config.mip_enabled and not per_splat:
@@ -62,8 +62,14 @@ class RasterBackward:
                 "backward does not propagate opacity-compensation gradients.")
         variant = (self.PER_BUCKET_KERNELS if per_bucket
                    else self.PER_SPLAT_KERNELS if per_splat else self.PER_PIXEL_KERNELS)
+        if geometry is not None and (geometry.image_terms or geometry.flatten_coefficient() > 0.0) \
+                and not per_splat:
+            raise RuntimeError("depth/normal/depth-normal and flatten losses need the per-splat backward: "
+                               "the per-pixel reference backward does not run them.")
         self._commands = commands
         self._k = kernels.load({**self.KERNELS, **variant})
+        # GeometryTerms (backend/render/geometry.py) when a geometry or flatten loss is on.
+        self.geometry = geometry
         self._rasterizer = rasterizer
         self._primitive = primitive
         self._raster = raster
@@ -107,6 +113,14 @@ class RasterBackward:
                 self._record_blend(stbn_kwargs, backward_stbn, tracking, hardness)
                 with self._commands.marker_group("projection_backward"):
                     self._record_projection()
+                if self.geometry is not None:
+                    with self._commands.marker_group("geom_backward"):
+                        self.geometry.record_backward(
+                            gaussians=self._primitive.values.storage,
+                            active_count=self._primitive.active_count.storage,
+                            camera=self._rasterizer.camera_buffer,
+                            cluster_visible=self._raster.cluster_visible.storage,
+                            grads=self._gradients.params)
             else:
                 self._record_per_pixel()
         if self._sh is not None:
@@ -133,6 +147,7 @@ class RasterBackward:
             grad_color_b=grads["color_b"].storage,
             grad_2d_x_iter=self._gradients.screen_x.storage,
             grad_2d_y_iter=self._gradients.screen_y.storage,
+            **(self.geometry.blend_kwargs() if self.geometry is not None else {}),
         )
 
     def _record_blend(self, stbn_kwargs: dict, backward_stbn: dict, tracking: dict,

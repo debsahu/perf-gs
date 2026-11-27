@@ -402,7 +402,10 @@ def read_colmap_image_bytes(entry: ColmapImageEntry, image_dir: Path) -> np.ndar
     path = image_dir / entry.image_name
     if not path.is_file():
         raise FileNotFoundError(f"image not found: {path}")
-    return np.fromfile(path, dtype=np.uint8)
+    data = np.fromfile(path, dtype=np.uint8)
+    if data.size == 0:
+        raise OSError(f"image file is empty: {path}")
+    return data
 
 
 def decode_colmap_image(data: np.ndarray, name: str | Path, width: int, height: int,
@@ -410,7 +413,10 @@ def decode_colmap_image(data: np.ndarray, name: str | Path, width: int, height: 
     """``load_colmap_image_native`` from the file's bytes (``read_colmap_image_bytes``):
     the same decoder flags, channel order and resize."""
     import cv2
-    array = cv2.imdecode(data, _image_flags(load_alpha))
+    try:
+        array = cv2.imdecode(data, _image_flags(load_alpha)) if data.size else None
+    except cv2.error as error:          # an empty or malformed buffer raises instead of returning None
+        raise OSError(f"failed to decode image: {name}: {error}") from error
     if array is None:
         raise OSError(f"failed to decode image: {name}")
     return _to_rgb_at_size(array, name, width, height, load_alpha)

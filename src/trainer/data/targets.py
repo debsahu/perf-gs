@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import operator
 import threading
 import time
 from collections import OrderedDict
@@ -48,25 +49,39 @@ def _resident(image: np.ndarray, mask: np.ndarray | None = None) -> tuple[np.nda
     return np.ascontiguousarray(image), channels
 
 
+def _read_only(array: np.ndarray) -> np.ndarray:
+    """``array`` itself when already read-only, else a read-only view of it (no copy)."""
+    if not array.flags.writeable:
+        return array
+    view = array.view()
+    view.flags.writeable = False
+    return view
+
+
 class _FloatTargets(Sequence):
     """``targets.srgb``: float32 sRGB [0, 1] made per access from the resident copy,
-    bit-identical to what ``load_colmap_image`` returns. Nothing is cached."""
+    bit-identical to what ``load_colmap_image`` returns. Nothing is cached.
 
-    def __init__(self, stored: list[np.ndarray], channels: list[int] | None) -> None:
-        self._stored = stored
-        self._channels = channels
+    ``lookup(index) -> (resident, exposed channels)`` reads a view once, so a compressed view is
+    fetched from its cache once per access. A float target is returned read-only: it is the
+    stored array itself, which every later read shares."""
+
+    def __init__(self, count: int, lookup: Callable[[int], tuple[np.ndarray, int | None]]) -> None:
+        self._count = count
+        self._lookup = lookup
 
     def __len__(self) -> int:
-        return len(self._stored)
+        return self._count
 
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        image = self._stored[index]
-        channels = image.shape[2] if self._channels is None else self._channels[index]
+        image, channels = self._lookup(index)
+        if channels is None:
+            channels = image.shape[2]
         if image.dtype != np.uint8:
             # Only a masked float target stores more channels than it exposes.
-            return image if channels == image.shape[2] else np.ascontiguousarray(image[..., :channels])
+            return _read_only(image) if channels == image.shape[2] else np.ascontiguousarray(image[..., :channels])
         if channels != image.shape[2]:
             image = np.ascontiguousarray(image[..., :channels])
         return to_float01(image)
@@ -138,23 +153,41 @@ class _DecodeCache:
 
     def prefetch(self, indices: Iterable[int]) -> None:
         window = list(dict.fromkeys(int(i) for i in indices))
-        submit = []
+        # Pool creation and submission stay under the lock, so close() cannot land in between: a pool made
+        # after close() would never be shut down, and a pool cleared before submit() would be None.
         with self._lock:
             if self._closed:
                 return
             self._pinned = set(window)
+            submit = []
             for index in window:
                 if index in self._cached or index in self._flight:
                     continue
                 self._flight[index] = future = Future()
                 submit.append((index, future))
             self._evict()
-        if submit and self._pool is None:
-            self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="target-decode")
-        for index, future in submit:
-            self._pool.submit(self._run, index, future)
+            if not submit:
+                return
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="target-decode")
+            for k, (index, future) in enumerate(submit):
+                try:
+                    self._pool.submit(self._run, index, future)
+                except BaseException as error:
+                    # Views never handed to the pool must not stay in flight: a reader would wait forever.
+                    for left, left_future in submit[k:]:
+                        self._flight.pop(left, None)
+                        if not left_future.done():
+                            left_future.set_exception(error)
+                    raise
 
     def _run(self, index: int, future: Future) -> None:
+        with self._lock:
+            if self._closed:                        # queued before close(), started after it
+                self._flight.pop(index, None)
+                if not future.done():
+                    future.set_exception(RuntimeError("the target decode cache was closed"))
+                return
         started = time.perf_counter()
         try:
             entry = self._decode(index)
@@ -175,6 +208,25 @@ class _DecodeCache:
             self._evict()
             self.peak_cached = max(self.peak_cached, len(self._cached))
             future.set_result(entry)
+
+    def store(self, index: int, entry: tuple, expected: tuple) -> None:
+        """Replace a cached view's entry, if it is still cached as ``expected``."""
+        with self._lock:
+            if self._cached.get(index) is expected:
+                self._cached[index] = entry
+
+    def drop_packed(self) -> None:
+        """Forget every cached view's packed array (the packer changed)."""
+        with self._lock:
+            for index, entry in self._cached.items():
+                self._cached[index] = (entry[0], entry[1], None)
+
+    def reset_stats(self) -> None:
+        """Restart the hit/miss/decode/wait counters; cached views are kept."""
+        with self._lock:
+            self.hits = self.misses = self.decodes = self.waits = 0
+            self.wait_s = self.decode_s = 0.0
+            self.peak_cached = len(self._cached)
 
     def _evict(self) -> None:
         unpinned = [i for i in self._cached if i not in self._pinned]
@@ -200,6 +252,7 @@ class _DecodeCache:
             pending = list(self._flight.values())
             self._flight.clear()
             self._cached.clear()
+            self._pinned = set()
             for future in pending:
                 if not future.done():
                     future.set_exception(RuntimeError("the target decode cache was closed"))
@@ -222,11 +275,7 @@ class _LazyColumn(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        if index < 0:
-            index += len(self)
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        return self._targets._entry(index)[self._column]
+        return self._targets._entry(self._targets._view_index(index))[self._column]
 
 
 class CompressedTargetViews(Mapping):
@@ -239,7 +288,9 @@ class CompressedTargetViews(Mapping):
         if not targets.compressed:
             raise ValueError("CompressedTargetViews needs a compressed TargetDataset")
         self._targets = targets
-        self._indices = list(range(len(targets.resident))) if indices is None else list(indices)
+        count = len(targets.resident)
+        self._indices = (list(range(count)) if indices is None
+                         else list(dict.fromkeys(targets._view_index(i) for i in indices)))
         self._keys = set(self._indices)
         targets.set_packer(pack)
 
@@ -352,26 +403,47 @@ class TargetDataset:
 
     def _decode(self, index: int) -> tuple:
         """(resident, exposed channels, packed) of one view, as the decoded residency holds it."""
-        import cv2
         data, mask_png = self._encoded[index]
         entry = self._scene.images[index]
         image = decode_colmap_image(data, entry.image_name, self._width, self._height,
                                     load_alpha=self._use_alpha)
         if self._masked:
             mask = (np.full(image.shape[:2], 255, np.uint8) if mask_png is None
-                    else cv2.imdecode(mask_png, cv2.IMREAD_GRAYSCALE))
+                    else self._decode_mask(index))
             resident, channels = _resident(image, mask)
         else:
             resident, channels = _resident(image)
+        # The cache hands these arrays to every reader: read-only, so no caller can change a later read.
+        resident = _read_only(resident)
         packer = self._packer
-        packed = None if packer is None else packer(resident)
+        packed = None if packer is None else _read_only(packer(resident))
         return resident, channels, packed
+
+    def _decode_mask(self, index: int) -> np.ndarray:
+        import cv2
+        mask = cv2.imdecode(self._encoded[index][1], cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise OSError(f"failed to decode the stored loss mask of {self._scene.images[index].image_name}")
+        return mask
+
+    def _view_index(self, index) -> int:
+        """``index`` as a view index in [0, count): negative counts from the end, non-integers are refused."""
+        count = len(self._encoded) if self.compressed else len(self._srgb)
+        value = operator.index(index)
+        if value < 0:
+            value += count
+        if not 0 <= value < count:
+            raise IndexError(f"view index {index} out of range for {count} views")
+        return value
 
     def _entry(self, index: int) -> tuple:
         entry = self._cache.get(index)
-        if entry[2] is None and self._packer is not None:
-            # Decoded before a packer was set (e.g. by write_ground_truths): pack now.
-            entry = (entry[0], entry[1], self._packer(entry[0]))
+        packer = self._packer
+        if entry[2] is None and packer is not None:
+            # Decoded before a packer was set (e.g. by --auto-lens): pack once and keep it.
+            packed = (entry[0], entry[1], _read_only(packer(entry[0])))
+            self._cache.store(index, packed, entry)
+            entry = packed
         return entry
 
     def _encoded_nbytes(self) -> int:
@@ -383,17 +455,26 @@ class TargetDataset:
         return getattr(self, "_compressed", False)
 
     def set_packer(self, pack: Callable[[np.ndarray], np.ndarray]) -> None:
-        """The resident -> packed conversion run with each decode (``TargetImages.pack``)."""
-        self._packer = pack
+        """The resident -> packed conversion run with each decode (``TargetImages.pack``). Views
+        already cached are re-packed with it on their next read."""
+        if pack is not self._packer:
+            self._packer = pack
+            self._cache.drop_packed()
 
     def prefetch(self, indices: Iterable[int]) -> None:
         """Decode these views ahead, in order, and keep them until the next call. No-op when
-        every target is already decoded."""
+        every target is already decoded. Indices are view indices (negative counts from the end);
+        an out-of-range or non-integer index is refused before anything changes."""
         if self.compressed:
-            self._cache.prefetch(indices)
+            self._cache.prefetch([self._view_index(i) for i in indices])
 
     def cache_stats(self) -> dict:
         return self._cache.stats() if self.compressed else {}
+
+    def reset_cache_stats(self) -> None:
+        """Restart the cache's counters (the training loop does at its first step)."""
+        if self.compressed:
+            self._cache.reset_stats()
 
     def decoded_nbytes(self) -> int:
         """Bytes of the views decoded right now (resident plus, when separate, packed)."""
@@ -412,7 +493,12 @@ class TargetDataset:
 
     @property
     def srgb(self) -> Sequence[np.ndarray]:
-        return _FloatTargets(self._srgb, getattr(self, "_channels", None))
+        if self.compressed:
+            return _FloatTargets(len(self._encoded),
+                                 lambda index: self._entry(self._view_index(index))[:2])
+        channels = getattr(self, "_channels", None)
+        return _FloatTargets(len(self._srgb),
+                             lambda index: (self._srgb[index], None if channels is None else channels[index]))
 
     @property
     def masked(self) -> bool:
@@ -424,11 +510,10 @@ class TargetDataset:
         if not self.masked:
             return None
         if self.compressed:
-            import cv2
             mask_png = self._encoded[camera_index][1]
             if mask_png is None:
                 return np.ones((self._height, self._width), bool)
-            return cv2.imdecode(mask_png, cv2.IMREAD_GRAYSCALE) >= 128
+            return self._decode_mask(camera_index) >= 128
         image = self._srgb[camera_index]
         return image[..., 3] >= (128 if image.dtype == np.uint8 else 0.5)
 

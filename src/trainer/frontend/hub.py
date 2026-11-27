@@ -274,6 +274,7 @@ class TrainingHub:
             self.app._start_profiler()
             self.app._create_training_services()
         except Exception as error:                     # noqa: BLE001
+            self.app._close_targets()                  # a half-built run may already hold a decode pool
             self._hub_run_failed("building the run", error)
             return
         finally:

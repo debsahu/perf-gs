@@ -325,7 +325,7 @@ def test_training_loop_prefetches_the_sampler_window():
 
     loop = TrainingLoop.__new__(TrainingLoop)
     loop.sampler = sampler
-    loop.args = SimpleNamespace(target_prefetch=3)
+    loop.args = SimpleNamespace(target_prefetch=3, iters=100)
     loop.target_textures = Views({i: f"t{i}" for i in range(10)})
     loop.runtime = SimpleNamespace(pipeline=SimpleNamespace(targets=SimpleNamespace(select=selected.append)),
                                    queue_limiter=SimpleNamespace(before_submit=lambda: None))
@@ -405,3 +405,283 @@ def test_close_fails_pending_reads_instead_of_hanging(tmp_path):
     assert isinstance(result.get("error"), RuntimeError)
     with pytest.raises(RuntimeError, match="closed"):
         _ = targets.resident[4]
+
+
+# ---------------------------------------------------------------- review regressions
+
+def test_memory_report_decodes_no_image(tmp_path, monkeypatch):
+    """The --run-report memory summary must not walk the compressed views: each read decodes a view."""
+    from trainer.frontend.app import TrainingApplication
+    import trainer.frontend.app as app_module
+    targets, log = _counting(tmp_path, n=6, cache_views=0)
+    views = CompressedTargetViews(targets, _pack())
+    stats = SimpleNamespace(to_numpy=lambda: np.zeros(2, np.uint32))
+    pipeline = SimpleNamespace(buffers=SimpleNamespace(sort=SimpleNamespace(stats=stats)), max_splats=1,
+                               max_sort_pairs=1)
+    monkeypatch.setattr(app_module, "allocated_bytes", lambda _buffers: {"x": 0})
+    monkeypatch.setattr(app_module, "query_video_memory", lambda _name: None)
+    app = SimpleNamespace(_pipeline=pipeline, _stream_targets=False, _targets=targets, target_textures=views,
+                          structure_textures={}, args=SimpleNamespace(run_report=True),
+                          device=SimpleNamespace(info=SimpleNamespace(adapter_name="x")))
+    summary = TrainingApplication._report_memory(app)
+    assert log == []
+    assert summary["gpu_view_cache"]["training_images_bytes"] == 0
+    assert summary["host_ram"]["packed_training_images_bytes"] == 0
+    _ = views[2]
+    assert log == [2]                       # the control: one read is one decode
+
+
+def test_float_view_decodes_once_per_read(tmp_path):
+    """targets.srgb[i] reads the cached entry once. Reading it twice (array, then channel count) decoded a cold view
+    twice at cache_views=0 and recorded a hit that never happened."""
+    targets, log = _counting(tmp_path, n=4, cache_views=0)
+    _ = targets.srgb[1]
+    assert log == [1]
+    assert targets.cache_stats()["hits"] == 0 and targets.cache_stats()["misses"] == 1
+
+
+def test_views_decoded_before_the_packer_are_packed_once(tmp_path):
+    """--auto-lens reads targets before CompressedTargetViews sets the packer: those cached views are packed on first
+    use and the packed array is kept, not re-packed on every access."""
+    targets, log = _counting(tmp_path, n=4, cache_views=4)
+    _ = targets.srgb[0]                     # decoded before any packer
+    pack, calls = _pack(), []
+    views = CompressedTargetViews(targets, lambda image: calls.append(1) or pack(image))
+    first = views[0]
+    assert views[0] is first and len(calls) == 1 and log == [0]
+    _ = targets.srgb[0], targets.resident[0]
+    assert len(calls) == 1
+
+
+def test_a_new_packer_repacks_cached_views(tmp_path):
+    targets, _ = _counting(tmp_path, n=2, cache_views=2)
+    CompressedTargetViews(targets, lambda image: np.zeros(1, np.uint8))
+    _ = targets.resident[0]
+    views = CompressedTargetViews(targets, _pack())
+    assert views[0].shape == (H, W, 4)
+
+
+def test_prefetch_normalizes_and_checks_indices(tmp_path):
+    targets, log = _counting(tmp_path, n=5, cache_views=0, decode_workers=1)
+    targets.prefetch([-1])
+    _ = targets.resident[4]                 # pinned under its real index: no second decode
+    assert log == [4] and targets.cache_stats()["pinned"] == 1
+    with pytest.raises(IndexError):
+        targets.prefetch([5])
+    with pytest.raises(TypeError):
+        targets.prefetch([1.5])
+    assert targets.cache_stats()["pinned"] == 1         # a refused window leaves the previous one
+
+
+def test_compressed_views_have_unique_in_range_keys(tmp_path):
+    targets, _ = _counting(tmp_path, n=4)
+    views = CompressedTargetViews(targets, _pack(), [2, 0, 2])
+    assert list(views) == [2, 0] and len(views) == 2
+    with pytest.raises(IndexError):
+        CompressedTargetViews(targets, _pack(), [4])
+
+
+def test_cached_views_are_read_only(tmp_path):
+    """The cache hands out the arrays it keeps: a caller writing into one would corrupt every later read."""
+    targets, _ = _counting(tmp_path, n=2, cache_views=2)
+    views = CompressedTargetViews(targets, _pack())
+    for array in (targets.resident[0], views[0]):
+        assert not array.flags.writeable
+    scene = _scene(tmp_path / "f", "png16")
+    for residency in ("decoded", "compressed"):
+        floats = TargetDataset(scene, W, H, use_alpha=True, residency=residency)
+        image = floats.srgb[0]
+        assert image.dtype == np.float32
+        with pytest.raises(ValueError):
+            image[0, 0, 0] = 2.0
+
+
+def test_training_starts_with_fresh_cache_stats(tmp_path):
+    """Startup reads (auto-lens, ground truths, probes) must not be reported as 'training waited': the counters
+    restart when the training loop begins. Cached views survive the reset."""
+    from trainer.frontend.app import TrainingLoop
+    targets, _ = _counting(tmp_path, n=3, cache_views=3)
+    _ = targets.srgb[0], targets.resident[0], targets.resident[1]
+    assert targets.cache_stats()["misses"] == 2
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.targets = targets
+    loop.args = SimpleNamespace(wait_for_viewer=False)
+    loop.runtime = SimpleNamespace(viewer=SimpleNamespace(set_training_active=lambda _on: None),
+                                   reporter=SimpleNamespace(start=lambda _t: None))
+    loop._begin_training_loop()
+    stats = targets.cache_stats()
+    assert (stats["hits"], stats["misses"], stats["decodes"], stats["waits"]) == (0, 0, 0, 0)
+    assert stats["wait_s"] == stats["decode_s"] == 0.0 and stats["cached"] == 2
+
+
+class _HookLock:
+    """A lock that runs ``after_release`` once, right after its first release: a deterministic interleaving point."""
+
+    def __init__(self, after_release):
+        self._lock, self._hook = threading.Lock(), after_release
+
+    def __enter__(self):
+        self._lock.acquire()
+
+    def __exit__(self, *exc):
+        self._lock.release()
+        hook, self._hook = self._hook, None
+        if hook is not None:
+            hook()
+
+
+def test_close_racing_prefetch_leaves_no_pool(tmp_path):
+    """close() landing between prefetch's locked section and its pool creation must not leave a new pool behind."""
+    targets, _ = _counting(tmp_path, n=3)
+    cache = targets._cache
+    cache._lock = _HookLock(lambda: cache.close())
+    cache.prefetch([0, 1])
+    assert cache._pool is None
+    with pytest.raises(RuntimeError, match="closed"):
+        cache.get(0)
+
+
+def test_a_failed_submit_fails_the_window_instead_of_hanging(tmp_path, monkeypatch):
+    """If the pool refuses a decode, the views already marked in flight must fail, not leave readers waiting."""
+    from concurrent.futures import ThreadPoolExecutor
+    targets, _ = _counting(tmp_path, n=3, decode_workers=1)
+
+    def refuse(self, *args, **kwargs):
+        raise RuntimeError("cannot schedule new futures")
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", refuse)
+    with pytest.raises(RuntimeError, match="schedule"):
+        targets.prefetch([0, 1])
+    monkeypatch.undo()
+    result = {}
+    reader = threading.Thread(target=lambda: result.update(view=targets.resident[1]), daemon=True)
+    reader.start()
+    reader.join(5)
+    assert not reader.is_alive(), "a read hung on a never-submitted decode"
+    assert result["view"].shape == (H, W, 4)
+
+
+def test_close_clears_the_pins_and_skips_queued_decodes(tmp_path):
+    targets, log = _counting(tmp_path, n=4, decode_workers=1)
+    cache = targets._cache
+    with cache._lock:
+        cache._pinned = {0, 1}
+    cache.close()
+    assert cache.stats()["pinned"] == 0
+    from concurrent.futures import Future
+    future = Future()
+    cache._run(3, future)                   # a decode the pool started after close()
+    assert log == [] and isinstance(future.exception(), RuntimeError)
+
+
+@pytest.mark.parametrize("path", ["start-training", "training-loop", "capture"])
+def test_cli_run_closes_its_targets(path):
+    """The decode pool and the pinned views are released when a CLI run ends, whatever ends it."""
+    from trainer.frontend.app import TrainingApplication
+    from trainer.frontend.profiling.instrumentation import CaptureFinished
+    closed = []
+    targets = SimpleNamespace(close=lambda: closed.append(1))
+
+    def build():
+        if path == "capture":
+            raise CaptureFinished()
+        raise RuntimeError("boom")
+    app = SimpleNamespace(targets=targets, build_training_loop=build,
+                          _training_runtime=SimpleNamespace(artifacts=SimpleNamespace(close_all=lambda: None)))
+    app._close_targets = lambda: TrainingApplication._close_targets(app)
+    app._train_and_write_artifacts = lambda hold: TrainingApplication._train_and_write_artifacts(app, hold)
+    if path == "start-training":
+        def prepare():
+            raise RuntimeError("setup failed")
+        app.prepare_training_context = prepare
+        app._run_training_and_post = lambda: None
+        with pytest.raises(RuntimeError, match="setup failed"):
+            TrainingApplication.start_training(app)
+    elif path == "training-loop":
+        with pytest.raises(RuntimeError, match="boom"):
+            TrainingApplication._run_training_and_post(app)
+    else:
+        TrainingApplication._run_training_and_post(app)
+    assert closed == [1]
+
+
+def test_hub_run_that_fails_to_build_closes_its_targets():
+    """A hub run whose setup fails after the targets were loaded must not leave their decode pool running."""
+    from trainer.frontend.hub import TrainingHub
+    import trainer.frontend.hub as hub_module
+    closed = []
+    noop = lambda *_a, **_k: None                                    # noqa: E731
+    state = SimpleNamespace(reset_for_new_run=noop, training_initializing=noop, begin_activity=noop, log=noop,
+                            training_failed=noop, notify=noop)
+    viewer = SimpleNamespace(state=state, clear_stop_request=noop, suspend_rendering=noop, resume_rendering=noop)
+
+    def begin():
+        raise RuntimeError("setup failed")
+    hub = TrainingHub.__new__(TrainingHub)
+    hub.app = SimpleNamespace(_viewer=viewer, viewer=viewer, _begin_repeat_run=begin,
+                              _close_targets=lambda: closed.append(1))
+    hub._hub_ensure_stbn = lambda _setup: True
+    real = hub_module.report_exception
+    hub_module.report_exception = noop
+    try:
+        hub._hub_train_scene("scene", {})
+    finally:
+        hub_module.report_exception = real
+    assert closed == [1]
+
+
+def test_target_prefetch_is_validated():
+    from trainer.config.validation import ConfigError, validate_training_config
+    from trainer.frontend.cli import parse_args
+    for value in ("-1", "9"):
+        args = parse_args(["--image-residency", "compressed", "--target-prefetch", value])
+        with pytest.raises(ConfigError, match="target-prefetch"):
+            validate_training_config(args, n_cams=8, n_train=8, n_test=1)
+    validate_training_config(parse_args(["--target-prefetch", "8"]), n_cams=8, n_train=8, n_test=1)
+
+
+def test_final_steps_prefetch_only_the_views_left_to_train():
+    from trainer.frontend.app import TrainingLoop
+    calls = []
+    sampler = CameraSampler("ours", list(range(10)), [], 1, np.random.default_rng(1))
+
+    class Views(dict):
+        def prefetch(self, indices):
+            calls.append(list(indices))
+
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.sampler = sampler
+    loop.args = SimpleNamespace(target_prefetch=4, iters=10)
+    loop.target_textures = Views({i: f"t{i}" for i in range(10)})
+    loop.runtime = SimpleNamespace(pipeline=SimpleNamespace(targets=SimpleNamespace(select=lambda _t: None)),
+                                   queue_limiter=SimpleNamespace(before_submit=lambda: None))
+    for step, ahead in ((7, 3), (9, 1), (10, 0)):
+        loop._prepare_iteration(SimpleNamespace(camera_index=sampler.next(), step_number=step))
+        assert len(calls[-1]) == 1 + ahead, (step, calls[-1])
+
+
+def test_empty_image_file_is_an_os_error(tmp_path):
+    from trainer.data.colmap import decode_colmap_image, read_colmap_image_bytes
+    scene = _scene(tmp_path, "png", n=1)
+    (scene.image_dir / scene.images[0].image_name).write_bytes(b"")
+    with pytest.raises(OSError, match="empty"):
+        read_colmap_image_bytes(scene.images[0], scene.image_dir)
+    with pytest.raises(OSError):
+        decode_colmap_image(np.frombuffer(b"not an image", np.uint8), "x.png", W, H)
+
+
+def test_lazy_column_takes_integer_like_indices(tmp_path):
+    targets, _ = _counting(tmp_path, n=3)
+    assert targets.resident[np.int64(1)].shape == (H, W, 4)
+    with pytest.raises(TypeError):
+        _ = targets.resident[1.0]
+
+
+def test_corrupt_stored_mask_is_an_os_error(tmp_path):
+    scene = _scene(tmp_path, "png", n=2)
+    targets = TargetDataset(scene, W, H, use_alpha=False, residency="compressed", masks_dir=_masks(tmp_path, scene))
+    data, _ = targets._encoded[0]
+    targets._encoded[0] = (data, np.frombuffer(b"broken", np.uint8))
+    with pytest.raises(OSError, match="mask"):
+        targets.keep_mask(0)
+    with pytest.raises(OSError, match="mask"):
+        _ = targets.resident[0]

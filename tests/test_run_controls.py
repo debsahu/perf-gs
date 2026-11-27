@@ -262,7 +262,7 @@ def _application(tmp_path, viewer, pipeline, events):
     app.device = SimpleNamespace(info=SimpleNamespace(adapter_name="test"))
     app._stream_targets = False
     app._memory_summary = {}
-    app.targets = SimpleNamespace(srgb=_targets(), linear=_targets().__getitem__)
+    app.targets = SimpleNamespace(srgb=_targets(), linear=_targets().__getitem__, close=lambda: None)
     app.scene_context = SimpleNamespace(colmapScene=_scene(), test_indices=[0, 1, 2],
                                         holdout_stride=1, camera_count=3)
     app.runtime = SimpleNamespace(

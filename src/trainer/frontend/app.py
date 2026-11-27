@@ -194,8 +194,16 @@ class TrainingApplication:
                                                   total_wall_s=time.perf_counter() - start)), flush=True)
 
     def start_training(self) -> None:
-        self.prepare_training_context()
-        self._run_training_and_post()
+        try:
+            self.prepare_training_context()
+            self._run_training_and_post()
+        finally:
+            self._close_targets()
+
+    def _close_targets(self) -> None:
+        """Stop the target decode pool and drop its views; reads afterwards raise. Idempotent."""
+        if getattr(self, "targets", None) is not None:
+            self.targets.close()
 
 
     def _begin_repeat_run(self) -> None:
@@ -243,6 +251,13 @@ class TrainingApplication:
         ``hold_viewer`` blocks on the viewer window afterwards (CLI); the hub passes False
         because blocking there would freeze its panel."""
         
+        try:
+            return self._train_and_write_artifacts(hold_viewer)
+        finally:
+            # Also when training raises or a capture ends it: release the decode pool and its views.
+            self._close_targets()
+
+    def _train_and_write_artifacts(self, hold_viewer: bool) -> str | None:
         # TRAINING LOOP IS HERE
         try:
             result = self.build_training_loop().launch_training_loop()
@@ -291,6 +306,8 @@ class TrainingApplication:
                 self._training_runtime.profiler.close()
             self._training_runtime.artifacts.close_all()
 
+        # Every target read is done; release the views before the CLI waits on the window.
+        self._close_targets()
         if hold_viewer:
             stats = viewer.state.snapshot().stats
             viewer.state.training_completed(ResultInfo(
@@ -336,8 +353,9 @@ class TrainingApplication:
                     and not np.may_share_memory(image, self._targets.resident[index])),
             }
             # Per-view textures live outside pipeline.buffers. Streamed views share scratch space.
+            # Compressed views are host arrays decoded on access: walking them would decode every view.
             summary["gpu_view_cache"] = {
-                "training_images_bytes": sum(
+                "training_images_bytes": 0 if isinstance(self.target_textures, CompressedTargetViews) else sum(
                     image.memory_usage.device for image in self.target_textures.values() if isinstance(image, spy.Texture)),
                 "structure_fields_bytes": sum(
                     field.memory_usage.device for field in self.structure_textures.values() if isinstance(field, spy.Texture)),
@@ -935,6 +953,10 @@ class TrainingLoop:
             f"training ended before reaching capture step {capture_step}")
 
     def _begin_training_loop(self) -> None:
+        # Startup reads (auto-lens, ground truths, probes) are not training waits: count from here.
+        reset = getattr(self.targets, "reset_cache_stats", None)
+        if reset is not None:
+            reset()
         if self.args.wait_for_viewer:
             self.runtime.viewer.wait_for_start()
         self.runtime.viewer.set_training_active(True)
@@ -1009,7 +1031,11 @@ class TrainingLoop:
         prefetch = getattr(self.target_textures, "prefetch", None)
         if prefetch is not None:
             # Compressed targets: keep this view and decode the sampler's next draws ahead.
-            prefetch([context.camera_index, *self.sampler.peek(self.args.target_prefetch)])
+            # Never past the last step: a view drawn after it is never trained on.
+            ahead = self.args.target_prefetch
+            if self.args.iters:
+                ahead = max(0, min(ahead, self.args.iters - context.step_number))
+            prefetch([context.camera_index, *self.sampler.peek(ahead)])
         self.runtime.pipeline.targets.select(self.target_textures[context.camera_index])
 
         if context.step_number == 1:

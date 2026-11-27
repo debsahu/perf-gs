@@ -72,6 +72,8 @@ def _texture(device: spy.Device, fmt: spy.Format, width: int, height: int, label
 
 
 def _buffer(device: spy.Device, size: int, label: str) -> spy.Buffer:
+    from trainer.backend.memory.buffers import check_storage_range
+    check_storage_range(label, size)        # the allocator's 4 GiB storage-buffer guard
     return device.create_buffer(size=size, usage=_BUF_COPY, label=label)
 
 

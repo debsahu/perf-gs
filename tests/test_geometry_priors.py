@@ -1040,3 +1040,15 @@ def test_skipped_depth_frame_logs_no_depth_loss():
     _, stats = _run_loss(p, _camera(w, h, 60.0), F, A, depth, None)
     assert stats["V_d"] > 0 and stats["depth_on"] == 0
     assert "depth - (" in p.geometry.log_line(stats)
+
+
+def test_geometry_buffers_pass_the_storage_range_guard(monkeypatch):
+    """The geometry buffers are created outside the allocator; they take the same 4 GiB storage-buffer guard."""
+    from trainer.backend.memory import buffers
+    device = _device(GEOM_PRIORS=True)
+    from trainer.backend.render.geometry import GeometryForward
+    p = _pipeline(device, GeometryConfig(depth_normal_weight=0.05))
+    monkeypatch.setattr(buffers, "STORAGE_BUFFER_RANGE", 64)
+    GeometryForward(device, p.kernels, width=W, height=H, capacity=4)    # 64 B of geom_data: fits
+    with pytest.raises(ValueError, match="geom_data"):
+        GeometryForward(device, p.kernels, width=W, height=H, capacity=16)

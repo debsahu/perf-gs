@@ -1032,7 +1032,8 @@ class TrainingLoop:
         if prefetch is not None:
             # Compressed targets: keep this view and decode the sampler's next draws ahead.
             # Never past the last step: a view drawn after it is never trained on.
-            ahead = self.args.target_prefetch
+            # At most every training view: a longer window would only repeat views already pinned.
+            ahead = min(self.args.target_prefetch, len(self.target_textures))
             if self.args.iters:
                 ahead = max(0, min(ahead, self.args.iters - context.step_number))
             prefetch([context.camera_index, *self.sampler.peek(ahead)])

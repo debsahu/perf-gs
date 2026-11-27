@@ -481,12 +481,19 @@ def test_compressed_views_have_unique_in_range_keys(tmp_path):
         CompressedTargetViews(targets, _pack(), [4])
 
 
-def test_cached_views_are_read_only(tmp_path):
-    """The cache hands out the arrays it keeps: a caller writing into one would corrupt every later read."""
+def test_cached_views_are_read_only_to_readers_and_uploadable(tmp_path):
+    """Readers of the dataset (resident, srgb) get read-only views of the cache's arrays, so none can change a later
+    read; the packed view the pipeline uploads stays writable, as slangpy's upload requires (a read-only one made
+    every compressed run fail at step 1)."""
     targets, _ = _counting(tmp_path, n=2, cache_views=2)
     views = CompressedTargetViews(targets, _pack())
-    for array in (targets.resident[0], views[0]):
-        assert not array.flags.writeable
+    resident = targets.resident[0]
+    assert not resident.flags.writeable
+    with pytest.raises(ValueError):
+        resident[0, 0, 0] = 1
+    packed = views[0]
+    assert packed.flags.writeable and packed.dtype == np.uint8 and packed.flags.c_contiguous
+    assert np.shares_memory(packed, resident)          # uint8 packs by reference: one decoded copy
     scene = _scene(tmp_path / "f", "png16")
     for residency in ("decoded", "compressed"):
         floats = TargetDataset(scene, W, H, use_alpha=True, residency=residency)
@@ -629,14 +636,35 @@ def test_hub_run_that_fails_to_build_closes_its_targets():
     assert closed == [1]
 
 
-def test_target_prefetch_is_validated():
+def test_target_prefetch_is_validated_and_the_default_always_passes():
+    """Negative is refused; a window past the view count (the default 4 with 2 training views) passes and is
+    clamped by the loop, as the validation docstring promises the defaults always pass."""
     from trainer.config.validation import ConfigError, validate_training_config
     from trainer.frontend.cli import parse_args
-    for value in ("-1", "9"):
-        args = parse_args(["--image-residency", "compressed", "--target-prefetch", value])
-        with pytest.raises(ConfigError, match="target-prefetch"):
-            validate_training_config(args, n_cams=8, n_train=8, n_test=1)
-    validate_training_config(parse_args(["--target-prefetch", "8"]), n_cams=8, n_train=8, n_test=1)
+    with pytest.raises(ConfigError, match="target-prefetch"):
+        validate_training_config(parse_args(["--image-residency", "compressed", "--target-prefetch", "-1"]),
+                                 n_cams=8, n_train=8, n_test=1)
+    for argv in (["--image-residency", "compressed"], ["--image-residency", "compressed", "--target-prefetch", "9"]):
+        validate_training_config(parse_args(argv), n_cams=3, n_train=2, n_test=1)
+
+
+def test_prefetch_window_is_clamped_to_the_training_views():
+    from trainer.frontend.app import TrainingLoop
+    calls = []
+    sampler = CameraSampler("ours", [0, 1], [], 1, np.random.default_rng(1))
+
+    class Views(dict):
+        def prefetch(self, indices):
+            calls.append(list(indices))
+
+    loop = TrainingLoop.__new__(TrainingLoop)
+    loop.sampler = sampler
+    loop.args = SimpleNamespace(target_prefetch=6, iters=100)
+    loop.target_textures = Views({0: "t0", 1: "t1"})
+    loop.runtime = SimpleNamespace(pipeline=SimpleNamespace(targets=SimpleNamespace(select=lambda _t: None)),
+                                   queue_limiter=SimpleNamespace(before_submit=lambda: None))
+    loop._prepare_iteration(SimpleNamespace(camera_index=sampler.next(), step_number=1))
+    assert len(calls[-1]) == 1 + 2
 
 
 def test_final_steps_prefetch_only_the_views_left_to_train():

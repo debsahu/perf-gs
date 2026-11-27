@@ -157,17 +157,62 @@ def test_viewer_grows_to_the_snapshot(device) -> None:
     assert viewer._pipeline.read_output_image()[..., 3].max() > 0
 
 
-def _train_scene(device, tmp_path, monkeypatch, residency: str) -> np.ndarray:
-    scene = write_colmap_scene(tmp_path / residency, views=[
-        (f"{i}.png", 16, 16, 20.0) for i in range(4)])
-    args = build_parser().parse_args([
-        "--scene", str(scene), "--no-viewer", "--iters", "4", "--max-splats", "64",
+def _visible_scene(root, size: int = 16, views: int = 4):
+    """A COLMAP text model the cameras actually see: an 8 x 8 grid of points 3 units ahead of four views a small
+    baseline apart, and textured photos (write_colmap_scene's points project outside a 16 px frame)."""
+    import cv2
+    sparse, images_dir = root / "sparse" / "0", root / "images"
+    sparse.mkdir(parents=True)
+    images_dir.mkdir()
+    rng = np.random.default_rng(4)
+    cameras, images = ["# camera list"], ["# image list"]
+    for i in range(views):
+        cameras.append(f"{i + 1} PINHOLE {size} {size} {size} {size} {size / 2} {size / 2}")
+        images.append(f"{i + 1} 1 0 0 0 {0.1 * i} 0 0 {i + 1} {i}.png")
+        images.append("0.0 0.0 -1")
+        photo = cv2.GaussianBlur(rng.integers(0, 256, (size, size, 3)).astype(np.uint8), (3, 3), 0)
+        assert cv2.imwrite(str(images_dir / f"{i}.png"), photo)
+    rows = ["# 3D points"]
+    g = np.linspace(-1.0, 1.0, 8)
+    for k, (x, y) in enumerate((x, y) for x in g for y in g):
+        r, gg, b = rng.integers(0, 256, 3)
+        rows.append(f"{k} {x} {y} 3.0 {r} {gg} {b} 0.5 0")
+    (sparse / "cameras.txt").write_text("\n".join(cameras) + "\n")
+    (sparse / "images.txt").write_text("\n".join(images) + "\n")
+    (sparse / "points3D.txt").write_text("\n".join(rows) + "\n")
+    return root
+
+
+def _train_scene(device, tmp_path, monkeypatch, residency: str, masks: bool = False, iters: int = 12,
+                 visible: bool = False, densify: bool = True) -> np.ndarray:
+    """A short structure-aware run (densify every step) in one image residency; the final splat buffer. With
+    ``masks`` every view drops a different quarter of its pixels (--masks: a LOSS_MASK device of its own)."""
+    import cv2
+    name = f"{residency}{'_masked' if masks else ''}"
+    scene = (_visible_scene(tmp_path / name) if visible
+             else write_colmap_scene(tmp_path / name, views=[(f"{i}.png", 16, 16, 20.0) for i in range(4)]))
+    argv = [
+        "--scene", str(scene), "--no-viewer", "--iters", str(iters), "--max-splats", "256" if visible else "64",
         "--width", "16", "--height", "16", "--eval-holdout-stride", "2",
         "--no-evaluation", "--no-write-ground-truths", "--preview-every", "0",
-        "--densify-mode", "structure_aware", "--densify-from", "0", "--densify-to", "4",
+        "--densify-mode", "structure_aware" if densify else "none", "--densify-from", "0", "--densify-to", str(iters),
         "--densify-every", "1", "--sad-accum-every", "1", "--sad-structure-every", "2",
-        "--image-residency", residency, "--run-report", "--run-name", residency,
-    ])
+        "--image-residency", residency, "--run-report", "--run-name", name,
+    ]
+    if masks:
+        mask_dir = tmp_path / f"{name}_masks"
+        mask_dir.mkdir()
+        for i in range(4):
+            keep = np.full((16, 16), 255, np.uint8)
+            keep[(i // 2) * 8:(i // 2 + 1) * 8, (i % 2) * 8:(i % 2 + 1) * 8] = 0
+            assert cv2.imwrite(str(mask_dir / f"{i}.png"), keep)
+        argv += ["--masks", str(mask_dir)]
+    args = build_parser().parse_args(argv)
+    own_device = None
+    if masks:
+        from trainer.frontend.factory import create_training_device
+        own_device = create_training_device(args)
+        device = own_device
     monkeypatch.setattr("trainer.frontend.app.create_training_device", lambda _args: device)
     # Earlier tests' devices count against this process's DXGI budget.
     monkeypatch.setattr("trainer.frontend.app.available_bytes", lambda *_: None)
@@ -176,27 +221,41 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str) -> np.ndarray:
     app = TrainingApplication(args)
     app.prepare_training_context()
     try:
-        assert app._stream_targets == (residency == "stream")
+        assert app._stream_targets == (residency in ("stream", "compressed"))
+        assert app.pipeline.loss_mask == masks
+        app.pipeline.runtime.wait_for_idle()
+        _train_scene.seed = app.pipeline.buffers.primitive.values.to_numpy().copy()
         app.build_training_loop().launch_training_loop()
         app.pipeline.runtime.wait_for_idle()
         memory = app._report_memory()
         ram, cache = memory["host_ram"], memory["gpu_view_cache"]
-        assert ram["decoded_images_bytes"] == 4 * 16 * 16 * 4      # u8_targets.patch: uint8 RGBA, not float RGB
         assert ram["linear_cache_bytes"] == 0
         packed_bytes = 2 * 16 * 16 * 4
+        if residency == "compressed":
+            assert ram["decoded_images_bytes"] == 0 and ram["encoded_images_bytes"] > 0
+            assert memory["target_cache"]["decodes"] > 0
+        else:
+            assert ram["decoded_images_bytes"] == 4 * 16 * 16 * 4      # u8_targets.patch: uint8 RGBA, not float RGB
         if residency == "stream":
             # the packed uint8 RGBA targets ARE the decoded arrays (one host copy): counted once, in decoded
             assert all(np.shares_memory(app.target_textures[i], app._targets.resident[i]) for i in app.target_textures)
             assert len(app.target_textures) * 16 * 16 * 4 == packed_bytes
+        if residency in ("stream", "compressed"):
             assert ram["packed_training_images_bytes"] == 0
             assert cache == {"training_images_bytes": 0, "structure_fields_bytes": 0}
         else:
             assert ram["packed_training_images_bytes"] == 0
             assert cache["training_images_bytes"] >= packed_bytes
             assert cache["structure_fields_bytes"] >= 2 * packed_bytes
-        return app.pipeline.buffers.primitive.values.to_numpy().copy()
+        if visible:
+            assert float(app.pipeline.buffers.raster.output_image.to_numpy()[..., 3].max()) > 0.5   # it renders
+        count = int(app.pipeline.buffers.primitive.active_count.to_numpy().view(np.uint32)[0])
+        _train_scene.count = count
+        return app.pipeline.buffers.primitive.values.to_numpy()[:count].copy()
     finally:
         app.runtime.artifacts.close_all()
+        if own_device is not None:
+            own_device.close()
 
 
 def test_streamed_training_matches_resident(device, tmp_path, monkeypatch) -> None:
@@ -268,3 +327,17 @@ def test_small_device_buffers_pass_the_storage_range_guard(device, monkeypatch) 
     spec = type("Spec", (), {"voxels": 8, "width": 2, "height": 2, "slices": 2})()
     with pytest.raises(ValueError, match="stbn_table"):
         StbnMask.from_table(device, np.zeros(8, np.uint32), spec)
+
+
+@pytest.mark.parametrize("masks", [False, True], ids=["plain", "masked"])
+def test_compressed_training_matches_stream(device, tmp_path, monkeypatch, masks) -> None:
+    """A real run in compressed residency (decode cache, prefetch window, packer, upload) trains the same splats as
+    the stream residency, bit for bit. Densification is off: before deterministic densify, two runs of one residency
+    already differ once it runs, so a difference would not be the residency's."""
+    monkeypatch.chdir(tmp_path)
+    run = dict(masks=masks, visible=True, iters=40, densify=False)
+    streamed = _train_scene(device, tmp_path, monkeypatch, "stream", **run)
+    seed = _train_scene.seed
+    compressed = _train_scene(device, tmp_path, monkeypatch, "compressed", **run)
+    assert not np.array_equal(streamed, seed[:len(streamed)])     # the run trained: the splats moved
+    np.testing.assert_array_equal(streamed, compressed)

@@ -44,9 +44,7 @@ def validate_training_config(args: argparse.Namespace, *, n_cams: int, n_train: 
     prefetch = getattr(args, "target_prefetch", 0)
     if prefetch < 0:
         raise ConfigError(f"--target-prefetch must be >= 0, got {prefetch}.")
-    if getattr(args, "image_residency", None) == "compressed" and prefetch > n_train:
-        raise ConfigError(f"--target-prefetch {prefetch} pins more views than the {n_train} training views; "
-                          f"at most {n_train} (all of them decoded) is meaningful.")
+    # A window past the training views is clamped to them by the loop (the defaults always pass).
     if not 0.0 < args.final_splat_fraction <= 1.0:
         raise ConfigError("--final-splat-fraction must be in (0, 1].")
     # The radix sort dispatches one group per 2,048 keys along a single GPU dimension (65,535 groups is the

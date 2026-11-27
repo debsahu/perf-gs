@@ -275,7 +275,9 @@ class _LazyColumn(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return [self[i] for i in range(*index.indices(len(self)))]
-        return self._targets._entry(self._targets._view_index(index))[self._column]
+        value = self._targets._entry(self._targets._view_index(index))[self._column]
+        # The cache's own array, shared with every later read: hand out a read-only view of it.
+        return _read_only(value) if isinstance(value, np.ndarray) else value
 
 
 class CompressedTargetViews(Mapping):
@@ -295,6 +297,8 @@ class CompressedTargetViews(Mapping):
         targets.set_packer(pack)
 
     def __getitem__(self, index: int) -> np.ndarray:
+        """The packed view the GPU upload takes. Writable (slangpy refuses a read-only upload): the trainer binds
+        it and never writes it; the dataset's own accessors (resident, srgb) hand out read-only views."""
         if index not in self._keys:
             raise KeyError(index)
         return self._targets._entry(index)[2]
@@ -413,10 +417,10 @@ class TargetDataset:
             resident, channels = _resident(image, mask)
         else:
             resident, channels = _resident(image)
-        # The cache hands these arrays to every reader: read-only, so no caller can change a later read.
-        resident = _read_only(resident)
+        # Kept writable: the packed array goes to the GPU upload, which slangpy refuses for a read-only array (and a
+        # uint8 view packs by reference, so resident IS packed). Readers get read-only views (_LazyColumn, srgb).
         packer = self._packer
-        packed = None if packer is None else _read_only(packer(resident))
+        packed = None if packer is None else packer(resident)
         return resident, channels, packed
 
     def _decode_mask(self, index: int) -> np.ndarray:
@@ -441,7 +445,7 @@ class TargetDataset:
         packer = self._packer
         if entry[2] is None and packer is not None:
             # Decoded before a packer was set (e.g. by --auto-lens): pack once and keep it.
-            packed = (entry[0], entry[1], _read_only(packer(entry[0])))
+            packed = (entry[0], entry[1], packer(entry[0]))
             self._cache.store(index, packed, entry)
             entry = packed
         return entry

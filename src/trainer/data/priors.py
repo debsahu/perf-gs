@@ -12,10 +12,10 @@ Accepted files (format decided by the magic bytes, never the extension):
   depth   16-bit grayscale PNG (mm, 0 invalid), or float32 TIFF (metres, 0 invalid)
   normal  8-bit RGB PNG, or float32 3-channel TIFF (unit, (0,0,0) invalid)
 Normal PNG encodings (``--normal-encoding``):
-  slam     code 128 decodes to 0, invalid = (128, 128, 128). The quantized codec of the
+  gray128     code 128 decodes to 0, invalid = (128, 128, 128). The quantized codec of the
            png-quantized prior format (see NOTICE.md).
   spirula  the same affine map, invalid = black (0, 0, 0), no code-128 rule.
-Float TIFFs are quantized at load (depth to mm, half to even; normals to the slam codes): one GPU
+Float TIFFs are quantized at load (depth to mm, half to even; normals to the gray128 codes): one GPU
 format and one decode path, at most 0.5 mm and 2/255 per component of loss.
 """
 
@@ -30,7 +30,7 @@ import numpy as np
 from trainer.data.targets import _DecodeCache
 
 PRIOR_SUFFIXES = (".png", ".tiff", ".tif")
-NORMAL_ENCODINGS = ("slam", "spirula")
+NORMAL_ENCODINGS = ("gray128", "spirula")
 _PNG = b"\x89PNG\r\n\x1a\n"
 _TIFF = (b"II*\x00", b"MM\x00*")
 DEPTH_MM_MAX = 65535
@@ -41,7 +41,7 @@ CHECK_MIN_FACING = 0.99
 CHECK_MIN_VALID = 0.5          # below it: a warning, not an error (partially valid maps are legitimate)
 CHECK_LENGTH_TOL = 0.02
 # No decoded normal may be longer than this. A unit normal quantized to 8 bits stays within ~1.01; a Spirula map
-# read as slam decodes each black (invalid) pixel to (-1, -1, -1), length 1.73, which a percentile would miss when
+# read as gray128 decodes each black (invalid) pixel to (-1, -1, -1), length 1.73, which a percentile would miss when
 # only a few pixels are black.
 CHECK_MAX_LENGTH = 1.1
 
@@ -154,7 +154,7 @@ def quantize_depth_m(depth_m: np.ndarray) -> np.ndarray:
 
 
 def encode_normal_codes(normal: np.ndarray) -> np.ndarray:
-    """Unit normals ((0,0,0) invalid) to slam uint8 codes: rint((n + 1) / 2 * 255), half to even. A pixel with a
+    """Unit normals ((0,0,0) invalid) to gray128 uint8 codes: rint((n + 1) / 2 * 255), half to even. A pixel with a
     non-finite component is invalid (the sentinel 128), as a non-finite depth is."""
     n = np.asarray(normal, dtype=np.float32)
     bad = ~np.isfinite(n).all(axis=-1)
@@ -186,7 +186,7 @@ def decode_depth(data: bytes, what: str = "depth prior") -> np.ndarray:
 
 
 def decode_normal(data: bytes, encoding: str, what: str = "normal prior") -> np.ndarray:
-    """Normal file bytes to slam uint8 codes (H, W, 3), invalid = (128, 128, 128)."""
+    """Normal file bytes to gray128 uint8 codes (H, W, 3), invalid = (128, 128, 128)."""
     if encoding not in NORMAL_ENCODINGS:
         raise PriorError(f"unknown normal encoding {encoding!r}")
     kind = _sniff(data)
@@ -295,7 +295,7 @@ def measure_normals(codes: np.ndarray, intrinsics: tuple[float, float, float, fl
 def check_normal_priors(views: Sequence[tuple[str, np.ndarray, tuple[float, float, float, float]]],
                         image_wh: tuple[int, int]) -> list[NormalCheck]:
     """Hard error unless every checked map faces the camera and is unit length (no decoded normal longer than
-    CHECK_MAX_LENGTH). A mostly invalid map is a warning. ``views`` = (name, slam codes, (fx, fy, cx, cy) at the
+    CHECK_MAX_LENGTH). A mostly invalid map is a warning. ``views`` = (name, gray128 codes, (fx, fy, cx, cy) at the
     image size)."""
     results = []
     for name, codes, intrinsics in views:
@@ -309,13 +309,13 @@ def check_normal_priors(views: Sequence[tuple[str, np.ndarray, tuple[float, floa
         if not c.passed():
             hint = ""
             if c.valid == 0.0:
-                hint = " The map has no valid pixel. Check --normal-encoding (slam: 128 = invalid; spirula: black)."
+                hint = " The map has no valid pixel. Check --normal-encoding (gray128: 128 = invalid; spirula: black)."
             elif c.facing < 0.5:
                 hint = " The map points AWAY from the camera; negate every normal (n -> -n) and write it again."
             elif (c.length_max > CHECK_MAX_LENGTH or abs(c.length_p01 - 1.0) > CHECK_LENGTH_TOL
                   or abs(c.length_p99 - 1.0) > CHECK_LENGTH_TOL):
                 hint = (" Some decoded normals are not unit length. Check --normal-encoding: a spirula map read as "
-                        "slam decodes black (invalid) pixels to (-1, -1, -1).")
+                        "gray128 decodes black (invalid) pixels to (-1, -1, -1).")
             raise PriorError(
                 f"normal prior {name} fails the load check (need facing >= {CHECK_MIN_FACING}, "
                 f"| |n| - 1 | <= {CHECK_LENGTH_TOL} at p1 and p99, every |n| <= {CHECK_MAX_LENGTH}).{hint}")
@@ -345,14 +345,14 @@ def _encode_png(image: np.ndarray) -> bytes:
 class PriorDataset:
     """The depth and normal priors of the training views, held as PNG bytes on the common grid.
 
-    ``entry(i)`` returns (uint16 mm (H, W) or None, uint8 RGBA slam codes (H, W, 4) or None),
+    ``entry(i)`` returns (uint16 mm (H, W) or None, uint8 RGBA gray128 codes (H, W, 4) or None),
     decoding through a bounded cache; ``prefetch`` decodes the sampler's next draws on a pool."""
 
     def __init__(self, image_names: Sequence[str], image_wh: tuple[int, int],
                  intrinsics: Sequence[tuple[float, float, float, float]], *,
                  native_sizes: Sequence[tuple[int, int] | None] | None = None,
                  depth_dir: str | Path | None = None, normal_dir: str | Path | None = None,
-                 normal_encoding: str = "slam", cache_views: int = 2, decode_workers: int = 2,
+                 normal_encoding: str = "gray128", cache_views: int = 2, decode_workers: int = 2,
                  check_normals: bool = True, train_indices: Sequence[int] | None = None) -> None:
         """Indexed like ``image_names``. With ``train_indices`` only those views' priors are matched, loaded and
         checked: a held-out view is never trained on, so its prior is never read."""
@@ -382,7 +382,7 @@ class PriorDataset:
             self._normal, self.normal_hw = self._load(
                 matched(normal_dir, "normal"),
                 lambda b, p: decode_normal(b, normal_encoding, str(p)),
-                lambda b: _sniff(b) == "png" and normal_encoding == "slam")
+                lambda b: _sniff(b) == "png" and normal_encoding == "gray128")
             self.counts["normal"] = sum(b is not None for b in self._normal)
             if check_normals:
                 have = [i for i in range(n) if self._normal[i] is not None]

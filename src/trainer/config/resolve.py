@@ -61,7 +61,7 @@ def geometry_config(args: argparse.Namespace) -> GeometryConfig:
         depth_source=str(g(args, "depth_source", "center")),
         depth_space=str(g(args, "depth_loss_space", "disparity")),
         normal_loss=str(g(args, "normal_loss", "l1")),
-        normal_encoding=str(g(args, "normal_encoding", "slam")),
+        normal_encoding=str(g(args, "normal_encoding", "gray128")),
         min_alpha=float(g(args, "geom_min_alpha", 0.5)),
         start_iter=int(g(args, "geom_from", 0)),
         units_per_meter=float(g(args, "geom_units_per_meter", 1.0)),

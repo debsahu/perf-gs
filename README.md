@@ -207,7 +207,7 @@ python -m trainer.frontend.app --scene SCENE --preset quality \
 | `--depth-source` | `center` | `center`: blended z of the means. `plane`: the pixel ray meets the blended splat plane |
 | `--depth-loss-space` | `disparity` | `disparity` 1/D - 1/Dg, `metric` D - Dg, `ssi` 1/D - (a/Dg + b) with a per-frame fit |
 | `--normal-loss` | `l1` | `l1` over components, or `cos` (1 - cos) |
-| `--normal-encoding` | `slam` | 8-bit normal PNGs: `slam` code 128 is 0 and (128,128,128) is invalid; `spirula` black is invalid |
+| `--normal-encoding` | `gray128` | 8-bit normal PNGs: `gray128` code 128 is 0 and (128,128,128) is invalid; `spirula` black is invalid |
 | `--geom-min-alpha` | 0.5 | pixels with less rendered alpha get no image term |
 | `--geom-from` | 0 | first step of the three image terms; before it nothing is composited, decoded or uploaded |
 | `--geom-units-per-meter` | 1 | for scenes not in metres |

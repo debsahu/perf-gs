@@ -131,7 +131,10 @@ def validate_geometry(args: argparse.Namespace) -> None:
             raise ConfigError(f"{flag} must be finite, got {value}.")
     for weight, folder, flag in (("--depth-loss-weight", "depth_dir", "--depth-dir"),
                                  ("--normal-loss-weight", "normal_dir", "--normal-dir")):
-        has_dir = bool(g(args, folder, None))
+        value = g(args, folder, None)
+        if value is not None and not str(value).strip():
+            raise ConfigError(f"{flag} is empty: it would read priors from the working directory.")
+        has_dir = bool(value)
         if weights[weight] > 0.0 and not has_dir:
             raise ConfigError(f"{weight} > 0 needs {flag}.")
         if has_dir and weights[weight] <= 0.0:

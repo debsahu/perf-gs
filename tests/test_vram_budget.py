@@ -184,11 +184,11 @@ def _visible_scene(root, size: int = 16, views: int = 4):
 
 
 def _train_scene(device, tmp_path, monkeypatch, residency: str, masks: bool = False, iters: int = 12,
-                 visible: bool = False, densify: bool = True) -> np.ndarray:
+                 priors: bool = False, visible: bool = False, densify: bool = True) -> np.ndarray:
     """A short structure-aware run (densify every step) in one image residency; the final splat buffer. With
     ``masks`` every view drops a different quarter of its pixels (--masks: a LOSS_MASK device of its own)."""
     import cv2
-    name = f"{residency}{'_masked' if masks else ''}"
+    name = f"{residency}{'_masked' if masks else ''}{'_priors' if priors else ''}"
     scene = (_visible_scene(tmp_path / name) if visible
              else write_colmap_scene(tmp_path / name, views=[(f"{i}.png", 16, 16, 20.0) for i in range(4)]))
     argv = [
@@ -207,9 +207,22 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str, masks: bool = Fa
             keep[(i // 2) * 8:(i // 2 + 1) * 8, (i % 2) * 8:(i % 2 + 1) * 8] = 0
             assert cv2.imwrite(str(mask_dir / f"{i}.png"), keep)
         argv += ["--masks", str(mask_dir)]
+    if priors:
+        # Depth in mm (a slanted ramp) and camera-facing normals (0, 0, -1), gray128-coded: every term and flatten on.
+        depth_dir, normal_dir = tmp_path / f"{name}_depth", tmp_path / f"{name}_normal"
+        depth_dir.mkdir()
+        normal_dir.mkdir()
+        ramp = (2000 + 40 * np.arange(16)[None, :] + 25 * np.arange(16)[:, None]).astype(np.uint16)
+        normal_bgr = np.zeros((16, 16, 3), np.uint8)
+        normal_bgr[..., 1:] = 128                         # RGB (128, 128, 0): n = (0, 0, -1)
+        for i in range(4):
+            assert cv2.imwrite(str(depth_dir / f"{i}.png"), ramp + 100 * i)
+            assert cv2.imwrite(str(normal_dir / f"{i}.png"), normal_bgr)
+        argv += ["--depth-dir", str(depth_dir), "--depth-loss-weight", "1.0", "--normal-dir", str(normal_dir),
+                 "--normal-loss-weight", "0.2", "--depth-normal-weight", "0.05", "--flatten-loss-weight", "1.0"]
     args = build_parser().parse_args(argv)
     own_device = None
-    if masks:
+    if masks or priors:
         from trainer.frontend.factory import create_training_device
         own_device = create_training_device(args)
         device = own_device
@@ -222,7 +235,7 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str, masks: bool = Fa
     app.prepare_training_context()
     try:
         assert app._stream_targets == (residency in ("stream", "compressed"))
-        assert app.pipeline.loss_mask == masks
+        assert app.pipeline.loss_mask == masks and app.pipeline.geom_priors == priors
         app.pipeline.runtime.wait_for_idle()
         _train_scene.seed = app.pipeline.buffers.primitive.values.to_numpy().copy()
         app.build_training_loop().launch_training_loop()
@@ -247,6 +260,9 @@ def _train_scene(device, tmp_path, monkeypatch, residency: str, masks: bool = Fa
             assert ram["packed_training_images_bytes"] == 0
             assert cache["training_images_bytes"] >= packed_bytes
             assert cache["structure_fields_bytes"] >= 2 * packed_bytes
+        if priors:
+            stats = app.pipeline.geometry.read_stats()          # the last step's: the terms really ran
+            assert stats["V_d"] > 0 and stats["V_n"] > 0 and stats["V_dn"] > 0, stats
         if visible:
             assert float(app.pipeline.buffers.raster.output_image.to_numpy()[..., 3].max()) > 0.5   # it renders
         count = int(app.pipeline.buffers.primitive.active_count.to_numpy().view(np.uint32)[0])
@@ -329,13 +345,14 @@ def test_small_device_buffers_pass_the_storage_range_guard(device, monkeypatch) 
         StbnMask.from_table(device, np.zeros(8, np.uint32), spec)
 
 
-@pytest.mark.parametrize("masks", [False, True], ids=["plain", "masked"])
-def test_compressed_training_matches_stream(device, tmp_path, monkeypatch, masks) -> None:
+@pytest.mark.parametrize("masks,priors", [(False, False), (True, False), (False, True), (True, True)],
+                         ids=["plain", "masked", "priors", "masked-priors"])
+def test_compressed_training_matches_stream(device, tmp_path, monkeypatch, masks, priors) -> None:
     """A real run in compressed residency (decode cache, prefetch window, packer, upload) trains the same splats as
     the stream residency, bit for bit. Densification is off: before deterministic densify, two runs of one residency
     already differ once it runs, so a difference would not be the residency's."""
     monkeypatch.chdir(tmp_path)
-    run = dict(masks=masks, visible=True, iters=40, densify=False)
+    run = dict(masks=masks, priors=priors, visible=True, iters=40, densify=False)
     streamed = _train_scene(device, tmp_path, monkeypatch, "stream", **run)
     seed = _train_scene.seed
     compressed = _train_scene(device, tmp_path, monkeypatch, "compressed", **run)

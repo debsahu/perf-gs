@@ -78,12 +78,12 @@ def test_depth_formats_decode_to_millimetres():
         assert got.dtype == np.uint16 and np.array_equal(got, want), name
 
 
-def test_normal_formats_decode_to_slam_codes():
+def test_normal_formats_decode_to_gray128_codes():
     ref = np.load(FORMATS / "normal_reference.npy")
     want = P.encode_normal_codes(ref)
     assert (want[0, 0] == 128).all()                         # the invalid (0,0,0) sentinel
     for name in ("normal_png-quantized.png", "normal_tiff-f32.tiff", "normal_tiff-f32-deflate.tiff"):
-        got = P.decode_normal((FORMATS / name).read_bytes(), "slam", name)
+        got = P.decode_normal((FORMATS / name).read_bytes(), "gray128", name)
         assert got.dtype == np.uint8 and np.array_equal(got, want), name
 
 
@@ -121,20 +121,20 @@ def _real():
     return meta, (folder / meta["normals_spirula"]["file"]).read_bytes()
 
 
-def test_spirula_black_is_invalid_and_slam_128_is_invalid():
+def test_spirula_black_is_invalid_and_gray128_128_is_invalid():
     codes = np.array([[[0, 0, 0], [128, 128, 128], [200, 30, 128]]], np.uint8)
     png = cv2.imencode(".png", codes[..., ::-1])[1].tobytes()
     spirula = P.decode_normal(png, "spirula")
-    slam = P.decode_normal(png, "slam")
+    gray128 = P.decode_normal(png, "gray128")
     n_sp = P.decode_normal_codes(spirula)
-    n_sl = P.decode_normal_codes(slam)
+    n_sl = P.decode_normal_codes(gray128)
     valid = lambda n: np.linalg.norm(n, axis=-1) > 0.5            # noqa: E731
     assert valid(n_sp).tolist() == [[False, False, True]]
-    assert valid(n_sl).tolist() == [[True, False, True]]         # slam reads black as (-1,-1,-1)
+    assert valid(n_sl).tolist() == [[True, False, True]]         # gray128 reads black as (-1,-1,-1)
     assert np.linalg.norm(n_sl[0, 0]) == pytest.approx(np.sqrt(3), rel=1e-6)
 
 
-def test_real_spirula_map_passes_as_spirula_and_fails_read_as_slam():
+def test_real_spirula_map_passes_as_spirula_and_fails_read_as_gray128():
     """T11: the encoding flag matters on real data, and the load check catches the wrong one."""
     meta, data = _real()
     K = meta["normals_spirula"]["intrinsics"]
@@ -148,7 +148,7 @@ def test_real_spirula_map_passes_as_spirula_and_fails_read_as_slam():
     holed[:, :24] = 0
     png = cv2.imencode(".png", holed)[1].tobytes()
     right = P.measure_normals(P.decode_normal(png, "spirula"), intr, wh)
-    wrong = P.measure_normals(P.decode_normal(png, "slam"), intr, wh)
+    wrong = P.measure_normals(P.decode_normal(png, "gray128"), intr, wh)
     assert right.passed(), right
     assert not wrong.passed() and wrong.valid > right.valid, (wrong, right)
 
@@ -196,21 +196,21 @@ def _spirula_png_with_black(wh, intr, fraction, rng):
     return codes, black
 
 
-def test_spirula_map_with_few_black_pixels_is_refused_as_slam():
-    """B1: under 1% black (p99 cannot see it), read as slam: the (-1,-1,-1) pixels are longer than 1.1."""
+def test_spirula_map_with_few_black_pixels_is_refused_as_gray128():
+    """B1: under 1% black (p99 cannot see it), read as gray128: the (-1,-1,-1) pixels are longer than 1.1."""
     rng = np.random.default_rng(4)
     intr, wh = (20.0, 20.0, 16.0, 12.0), (64, 48)
     codes, black = _spirula_png_with_black(wh, intr, 0.006, rng)
     assert 0 < black.mean() < 0.01
     png = cv2.imencode(".png", codes[..., ::-1])[1].tobytes()
-    as_slam = P.measure_normals(P.decode_normal(png, "slam"), intr, wh)
-    assert abs(as_slam.length_p99 - 1.0) <= P.CHECK_LENGTH_TOL        # the percentile test alone would pass it
-    with pytest.raises(P.PriorError, match="spirula map read as slam"):
-        _check(P.decode_normal(png, "slam"), intr, wh)
+    as_gray128 = P.measure_normals(P.decode_normal(png, "gray128"), intr, wh)
+    assert abs(as_gray128.length_p99 - 1.0) <= P.CHECK_LENGTH_TOL        # the percentile test alone would pass it
+    with pytest.raises(P.PriorError, match="spirula map read as gray128"):
+        _check(P.decode_normal(png, "gray128"), intr, wh)
     _check(P.decode_normal(png, "spirula"), intr, wh)
 
 
-def test_dataset_decodes_spirula_black_to_the_slam_sentinel(tmp_path):
+def test_dataset_decodes_spirula_black_to_the_gray128_sentinel(tmp_path):
     """B2: a spirula PNG already on the common grid is re-encoded, not kept as file bytes, so its black
     pixels reach the GPU as (128, 128, 128)."""
     rng = np.random.default_rng(5)
@@ -373,7 +373,7 @@ def test_cli_defaults_are_off():
     args = _args()
     g = geometry_config(args)
     assert not g.enabled and g.depth_source == "center" and g.depth_space == "disparity"
-    assert g.normal_loss == "l1" and g.normal_encoding == "slam" and g.min_alpha == 0.5
+    assert g.normal_loss == "l1" and g.normal_encoding == "gray128" and g.min_alpha == 0.5
     assert not shader_specialization(args).geom_priors
 
 
@@ -655,3 +655,23 @@ def test_fixture_comment_names_only_this_repository():
     """The shared normals fixture described its consumers by paths in another repository; it must stand alone."""
     text = json.loads((FIX / "normals_from_depth_slanted_plane.json").read_text())["_comment"]
     assert "ingest/" not in text and "make_fixture" not in text and "test_geometry_priors.py" in text
+
+
+def test_normal_encoding_names_are_neutral():
+    """The 128-is-zero encoding is named for its rule, not for a private project: --normal-encoding gray128."""
+    assert _args().normal_encoding == "gray128"
+    assert "gray128" in P.NORMAL_ENCODINGS and "slam" not in P.NORMAL_ENCODINGS
+    with pytest.raises(SystemExit):
+        _args("--normal-encoding", "slam")
+
+
+@pytest.mark.parametrize("flag", ["--depth-dir", "--normal-dir"])
+def test_empty_prior_dirs_are_refused(flag):
+    """An empty --depth-dir beside a set --normal-dir (or the other way) reached PriorDataset as Path("") and
+    scanned the working directory."""
+    from trainer.config.validation import ConfigError, validate_geometry
+    other, weight = (("--normal-dir", "--normal-loss-weight") if flag == "--depth-dir"
+                     else ("--depth-dir", "--depth-loss-weight"))
+    argv = [flag, "", other, "p", weight, "1"]            # the empty one's own weight is 0
+    with pytest.raises(ConfigError, match=flag):
+        validate_geometry(_args(*argv))

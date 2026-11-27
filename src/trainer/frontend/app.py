@@ -99,7 +99,7 @@ def load_priors(args, scene):
     return PriorDataset([e.image_name for e in images], (scene.width, scene.height), intrinsics,
                         native_sizes=[getattr(e, "native_size", None) for e in images],
                         depth_dir=depth_dir, normal_dir=normal_dir,
-                        normal_encoding=getattr(args, "normal_encoding", "slam"),
+                        normal_encoding=getattr(args, "normal_encoding", "gray128"),
                         cache_views=2, decode_workers=2, train_indices=list(scene.train_indices))
 
 

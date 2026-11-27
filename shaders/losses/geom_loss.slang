@@ -142,7 +142,7 @@ float3 priorNormal(uint2 p, Texture2D<uint4> normal_prior, GeomFrame f)
     uint4 code = normal_prior.Load(int3(int2(priorTexel(p, f.frame_dim, uint2(w, h))), 0));
     float3 g = geomDecodeNormal(code.xyz);
     // A target must be (near) unit length: 0.7 <= |g| <= 1.3. Anything else is a sentinel or a misread
-    // encoding (a black pixel of a spirula map read as slam decodes to (-1, -1, -1), length 1.73).
+    // encoding (a black pixel of a spirula map read as gray128 decodes to (-1, -1, -1), length 1.73).
     float l2 = dot(g, g);
     // Normalised: 8-bit codes are up to ~1% off unit length, and 1 - dot(nh, g) must not go below 0.
     return (l2 >= 0.49 && l2 <= 1.69) ? g * rsqrt(l2) : float3(0.0);

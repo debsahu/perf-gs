@@ -251,7 +251,7 @@ class GeometryConfig:
     depth_source: str = "center"        # center | plane
     depth_space: str = "disparity"      # disparity | metric | ssi
     normal_loss: str = "l1"             # l1 | cos
-    normal_encoding: str = "slam"       # slam | spirula
+    normal_encoding: str = "gray128"       # gray128 | spirula
     min_alpha: float = 0.5
     start_iter: int = 0                 # first step the three image terms are on
     units_per_meter: float = 1.0

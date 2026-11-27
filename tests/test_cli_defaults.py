@@ -154,7 +154,7 @@ EXPECTED_DEFAULTS = {
     # Depth and normal priors: every term off, no prior folder picked up by itself.
     "depth_dir": None,
     "normal_dir": None,
-    "normal_encoding": "slam",
+    "normal_encoding": "gray128",
     "depth_loss_weight": 0.0,
     "normal_loss_weight": 0.0,
     "depth_normal_weight": 0.0,

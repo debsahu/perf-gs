@@ -154,9 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="normal priors, same naming: 8-bit RGB PNG or float32 3-channel TIFF, camera "
                          "frame (OpenCV), facing the camera. Checked at load: a map that points away "
                          "from the camera is refused.")
-    geometry.add_argument("--normal-encoding", choices=["slam", "spirula"], default="slam",
-                    help="8-bit normal PNGs: slam = code 128 decodes to 0, (128,128,128) invalid; "
-                         "spirula = same map, black (0,0,0) invalid. Default slam.")
+    geometry.add_argument("--normal-encoding", choices=["gray128", "spirula"], default="gray128",
+                    help="8-bit normal PNGs: gray128 = code 128 decodes to 0, (128,128,128) invalid; "
+                         "spirula = same map, black (0,0,0) invalid. Default gray128.")
     geometry.add_argument("--depth-loss-weight", type=float, default=0.0,
                     help="depth prior loss weight (needs --depth-dir). Default 0 = off.")
     geometry.add_argument("--normal-loss-weight", type=float, default=0.0,

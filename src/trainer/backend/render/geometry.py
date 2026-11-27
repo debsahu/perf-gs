@@ -183,7 +183,7 @@ class GeometryTerms:
                                      "geom_normal_prior")
 
     def select(self, depth_mm: np.ndarray | None, normal_codes: np.ndarray | None) -> None:
-        """This step's priors: uint16 millimetres (H, W) and slam-coded uint8 normals (H, W, 4),
+        """This step's priors: uint16 millimetres (H, W) and gray128-coded uint8 normals (H, W, 4),
         either None for a view without one. Uploaded inside the next recorded loss."""
         if depth_mm is not None:
             assert depth_mm.dtype == np.uint16 and depth_mm.shape == self.depth_hw, (depth_mm.shape, self.depth_hw)
